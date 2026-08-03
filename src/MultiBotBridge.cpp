@@ -18,6 +18,7 @@
 #include "RandomPlayerbotMgr.h"
 #include "ReputationMgr.h"
 #include "AiObjectContext.h"
+#include "Formations.h"
 #include "ScriptedGossip.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
@@ -63,6 +64,8 @@ void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& b
 void RunTrainerLearnCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& trainerEntryValue, std::string const& spellIdValue);
 void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& skillIdValue, std::string const& spellIdValue, std::string const& itemIdValue);
 void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue);
+void RunFormationCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedFormation);
+void SendFormationPackets(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken);
 void SendBotReputationPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void SendBotEmblemPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 uint32 GetPct(uint32 current, uint32 max);
@@ -80,6 +83,12 @@ std::string Trim(std::string const& value)
 std::string ToUpper(std::string value)
 {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return std::toupper(c); });
+    return value;
+}
+
+std::string ToLower(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return std::tolower(c); });
     return value;
 }
 
@@ -3696,6 +3705,151 @@ bool BotMatchesCombatScope(Player* requester, Player* bot, std::string const& sc
     return BotMatchesRTIScope(requester, bot, scope, target);
 }
 
+bool IsAllowedFormationName(std::string const& formation)
+{
+    static std::set<std::string> const allowed =
+    {
+        "arrow",
+        "queue",
+        "near",
+        "melee",
+        "line",
+        "circle",
+        "chaos",
+        "shield"
+    };
+
+    return allowed.find(formation) != allowed.end();
+}
+
+void SendFormationPackets(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken)
+{
+    std::string const scope = ToUpper(Trim(scopeValue));
+    std::string const target = Trim(UrlDecodeField(encodedTarget));
+    std::string const token = Trim(requestToken);
+
+    std::vector<std::pair<std::string, std::string>> entries;
+
+    if (requester && scope == "GROUP" && target.empty() && !token.empty() && token.size() <= 64)
+    {
+        Group* const requesterGroup = requester->GetGroup();
+        if (requesterGroup)
+        {
+            for (Player* const bot : GetBridgeVisibleBots(requester))
+            {
+                if (!bot || bot->GetGroup() != requesterGroup)
+                    continue;
+
+                std::string formation = "?";
+
+                PlayerbotAI* const botAI = GetBotAI(bot);
+                if (botAI && botAI->GetAiObjectContext())
+                {
+                    AiObjectContext* const context = botAI->GetAiObjectContext();
+                    FormationValue* const value = (FormationValue*)context->GetValue<Formation*>("formation");
+                    if (value)
+                    {
+                        formation = Trim(value->Save());
+                        if (formation.empty())
+                            formation = "?";
+                    }
+                }
+
+                entries.emplace_back(bot->GetName(), formation);
+            }
+        }
+    }
+
+    std::sort(entries.begin(), entries.end(), [](std::pair<std::string, std::string> const& left, std::pair<std::string, std::string> const& right)
+    {
+        return left.first < right.first;
+    });
+
+    std::ostringstream beginPayload;
+    beginPayload << token << kFieldSeparator << entries.size();
+    SendAddonPacket(requester, replyType, "FORMATIONS_BEGIN", beginPayload.str());
+
+    uint32 sent = 0;
+    for (std::pair<std::string, std::string> const& entry : entries)
+    {
+        std::ostringstream itemPayload;
+        itemPayload << token
+            << kFieldSeparator << UrlEncodeField(entry.first)
+            << kFieldSeparator << UrlEncodeField(entry.second);
+
+        SendAddonPacket(requester, replyType, "FORMATIONS_ITEM", itemPayload.str());
+        ++sent;
+    }
+
+    std::ostringstream endPayload;
+    endPayload << token << kFieldSeparator << sent;
+    SendAddonPacket(requester, replyType, "FORMATIONS_END", endPayload.str());
+}
+
+bool ApplyNativeFormation(Player* bot, std::string const& formation)
+{
+    if (!bot || !IsAllowedFormationName(formation))
+        return false;
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI)
+        return false;
+
+    AiObjectContext* const context = botAI->GetAiObjectContext();
+    if (!context)
+        return false;
+
+    FormationValue* const value = static_cast<FormationValue*>(context->GetValue<Formation*>("formation"));
+    if (!value || !value->Load(formation))
+        return false;
+
+    return value->Save() == formation;
+}
+
+void RunFormationCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedFormation)
+{
+    std::string const scope = ToUpper(Trim(scopeValue));
+    std::string const target = Trim(UrlDecodeField(encodedTarget));
+    std::string const token = Trim(requestToken);
+    std::string const formation = ToLower(Trim(UrlDecodeField(encodedFormation)));
+    uint32 succeeded = 0;
+    uint32 failed = 0;
+
+    bool const validRequest =
+        requester &&
+        scope == "GROUP" &&
+        target.empty() &&
+        !token.empty() &&
+        token.size() <= 64 &&
+        formation.size() <= 16 &&
+        IsAllowedFormationName(formation);
+
+    Group* const requesterGroup = validRequest ? requester->GetGroup() : nullptr;
+    if (requesterGroup)
+    {
+        for (Player* const bot : GetBridgeVisibleBots(requester))
+        {
+            if (!bot || bot->GetGroup() != requesterGroup)
+                continue;
+
+            if (ApplyNativeFormation(bot, formation))
+                ++succeeded;
+            else
+                ++failed;
+        }
+    }
+
+    std::ostringstream payload;
+    payload << scope
+        << kFieldSeparator << UrlEncodeField(target)
+        << kFieldSeparator << token
+        << kFieldSeparator << succeeded
+        << kFieldSeparator << failed
+        << kFieldSeparator << UrlEncodeField(formation);
+
+    SendAddonPacket(requester, replyType, "FORMATION_ACK", payload.str());
+}
+
 void RunRTICommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
 {
     std::string const scope = ToUpper(Trim(scopeValue));
@@ -4180,6 +4334,15 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             return true;
         }
 
+        if (requestType == "FORMATIONS")
+        {
+            std::pair<std::string, std::string> const scopeSplit = SplitOnce(request.second, kFieldSeparator);
+            std::pair<std::string, std::string> const targetSplit = SplitOnce(scopeSplit.second, kFieldSeparator);
+
+            SendFormationPackets(player, replyType, scopeSplit.first, targetSplit.first, targetSplit.second);
+            return true;
+        }
+
         if (requestType == "TALENT_SPEC_LIST")
         {
             std::pair<std::string, std::string> const specRequest = SplitOnce(request.second, kFieldSeparator);
@@ -4345,6 +4508,16 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             std::pair<std::string, std::string> const actionRequest = SplitOnce(tokenRequest.second, kFieldSeparator);
             std::pair<std::string, std::string> const itemRequest = SplitOnce(actionRequest.second, kFieldSeparator);
             RunInventoryItemActionCommand(player, replyType, botRequest.first, tokenRequest.first, actionRequest.first, itemRequest.first, itemRequest.second);
+            return true;
+        }
+
+        if (requestType == "FORMATION")
+        {
+            std::pair<std::string, std::string> const scopeSplit = SplitOnce(request.second, kFieldSeparator);
+            std::pair<std::string, std::string> const targetSplit = SplitOnce(scopeSplit.second, kFieldSeparator);
+            std::pair<std::string, std::string> const tokenSplit = SplitOnce(targetSplit.second, kFieldSeparator);
+
+            RunFormationCommand(player, replyType, scopeSplit.first, targetSplit.first, tokenSplit.first, tokenSplit.second);
             return true;
         }
 
