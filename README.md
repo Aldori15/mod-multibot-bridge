@@ -313,6 +313,14 @@ Server -> Addon:  MBOT ROSTER~...
 
 Addon  -> Server: MBOT GET~STATES
 Server -> Addon:  MBOT STATES~...
+
+Addon  -> Server: MBOT RUN~FORMATION~GROUP~~<token>~<formation>
+Server -> Addon:  MBOT FORMATION_ACK~GROUP~~<token>~<success>~<failure>~<formation>
+
+Addon  -> Server: MBOT GET~FORMATIONS~GROUP~~<token>
+Server -> Addon:  MBOT FORMATIONS_BEGIN~<token>~<count>
+Server -> Addon:  MBOT FORMATIONS_ITEM~<token>~<botName>~<formation>
+Server -> Addon:  MBOT FORMATIONS_END~<token>~<sentCount>
 ```
 
 The exact payloads are consumed internally by the MultiBot addon.
@@ -341,6 +349,10 @@ The exact payloads are consumed internally by the MultiBot addon.
   <tr>
     <td><code>GET~STATES</code></td>
     <td>Refresh bot state flags and UI state data.</td>
+  </tr>
+  <tr>
+    <td><code>GET~FORMATIONS</code></td>
+    <td>Read the effective current formation of every controllable bot in the player's current party or raid and return one structured item per bot.</td>
   </tr>
   <tr>
     <td><code>GET~DETAILS</code></td>
@@ -439,6 +451,10 @@ The exact payloads are consumed internally by the MultiBot addon.
     <td>Run whitelist-only disperse distance and disable commands.</td>
   </tr>
   <tr>
+    <td><code>RUN~FORMATION</code></td>
+    <td>Apply one validated formation to every controllable bot in the player's current party or raid and return aggregate success/failure counts.</td>
+  </tr>
+  <tr>
     <td><code>RUN~LOOT</code></td>
     <td>Run whitelist-only loot rules and loot list commands without addon-side chat parsing.</td>
   </tr>
@@ -463,6 +479,8 @@ ss ?
 ```
 
 The bridge only replaces the automatic data-refresh paths used by the addon UI.
+
+Formation selection and inspection are also bridge-first. `RUN~FORMATION` applies a validated formation across the whole current party or raid, while `GET~FORMATIONS` reads the effective value from each controllable bot. Neither path requires PARTY, RAID, whisper or `TellMaster` output. The `GROUP` scope intentionally covers the complete party or raid; individual raid subgroups are not targeted.
 
 ---
 
@@ -523,6 +541,24 @@ MultiBot.allowLegacyChatFallback = false
 ```
 
 Only enable legacy fallback temporarily for debugging.
+
+</details>
+
+<details>
+<summary><strong>Formation changes or formation status do not reach the addon</strong></summary>
+
+Check the server console for the structured formation requests and responses:
+
+```text
+RUN~FORMATION~GROUP~~<token>~circle
+FORMATION_ACK~GROUP~~<token>~<success>~<failure>~circle
+GET~FORMATIONS~GROUP~~<token>
+FORMATIONS_BEGIN~<token>~<count>
+FORMATIONS_ITEM~<token>~<botName>~<formation>
+FORMATIONS_END~<token>~<sentCount>
+```
+
+Only controllable bots in the player's current party or raid are included. The bridge does not expose or target bots outside that group, and it does not apply formations separately to raid subgroups.
 
 </details>
 
@@ -638,6 +674,7 @@ Design goals:
 - Keep the bridge protocol stable enough for addon-side consumers.
 - Avoid unnecessary server-side behavior changes outside the bridge.
 - Keep the module installable as a normal AzerothCore module.
+- Keep formation operations inside the bridge by using the existing Playerbots `FormationValue` API; no modification of `mod-playerbots` is required.
 
 ---
 
