@@ -325,6 +325,42 @@ Server -> Addon:  MBOT FORMATIONS_END~<token>~<sentCount>
 
 The exact payloads are consumed internally by the MultiBot addon.
 
+## Protocol input hardening
+
+The server accepts bridge traffic only when the addon envelope is exactly
+`MBOT\t<opcode>...` and the chat language is `LANG_ADDON`.
+
+The bridge enforces the following input rules before any endpoint is called:
+
+- maximum wire size: 255 bytes;
+- maximum extracted bridge payload: 250 bytes;
+- opcode length: 1 to 24 characters;
+- request type length: 1 to 32 characters;
+- existing request tokens: 1 to 64 characters using letters, digits, `-`, `_`,
+  `.` or `:`;
+- exact field count for every supported `GET` and `RUN` request;
+- strict unsigned decimal parsing with overflow and range rejection;
+- strict `%XX` field decoding;
+- rejection of control characters;
+- a maximum `ITEM_ACTION` count of 1000, while `0` keeps its existing
+  endpoint-specific meaning.
+
+Malformed bridge requests are consumed and answered with:
+
+```text
+MBOT ERR~<opcode>~<requestType>~<token>~<reason>
+```
+
+Console diagnostics log only the player, opcode, lengths, chat type and rejection
+reason. Untrusted request and response payloads are no longer written verbatim.
+
+The `RAID` execution scope now requires the requester and the bot to be members
+of the same actual raid. It is no longer treated as the unrestricted `ALL`
+scope.
+
+Outgoing response framing and pagination remain a separate protocol task. This
+hardening change does not fragment existing server responses.
+
 ---
 
 # Supported Bridge Areas
