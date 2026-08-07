@@ -4085,9 +4085,13 @@ bool VerifyStrategyMutationResult(
     if (!botAI)
         return false;
 
-    for (StrategyMutationOperation const& operation : operations)
+    std::set<std::string> verifiedStrategies;
+    for (auto operation = operations.rbegin(); operation != operations.rend(); ++operation)
     {
-        if (botAI->HasStrategy(operation.name, botState) != operation.enable)
+        if (!verifiedStrategies.insert(operation->name).second)
+            continue;
+
+        if (botAI->HasStrategy(operation->name, botState) != operation->enable)
             return false;
     }
 
@@ -4809,7 +4813,17 @@ void SendStateAbort(Player* player, ChatMsg replyType, std::string const& token,
 {
     std::ostringstream payload;
     payload << token << kFieldSeparator << UrlEncodeField(botName) << kFieldSeparator << UrlEncodeField(reason);
-    SendStateAddonPacket(player, replyType, "STATE_ABORT", payload.str());
+    if (SendStateAddonPacket(player, replyType, "STATE_ABORT", payload.str()))
+        return;
+
+    std::ostringstream fallbackPayload;
+    fallbackPayload << token << kFieldSeparator << kFieldSeparator << UrlEncodeField(reason);
+    if (SendStateAddonPacket(player, replyType, "STATE_ABORT", fallbackPayload.str()))
+        return;
+
+    std::ostringstream minimalPayload;
+    minimalPayload << token << kFieldSeparator << kFieldSeparator << "ABORT_TOO_LONG";
+    SendStateAddonPacket(player, replyType, "STATE_ABORT", minimalPayload.str());
 }
 
 bool AppendStateFramePacket(
@@ -4962,6 +4976,7 @@ void SendFramedStatePackets(Player* player, ChatMsg replyType, std::string const
 void SendStatePackets(Player* player, ChatMsg replyType)
 {
     bool sent = false;
+    bool stateTooLong = false;
     for (Player* const bot : GetBridgeVisibleBots(player))
     {
         PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
@@ -4977,12 +4992,14 @@ void SendStatePackets(Player* player, ChatMsg replyType)
         std::ostringstream out;
         out << bot->GetName() << kFieldSeparator << combatStrategies << kFieldSeparator << nonCombatStrategies;
         if (!SendStateAddonPacket(player, replyType, "STATE", out.str()))
-            SendProtocolError(player, replyType, "GET", "STATES", "", "STATE_TOO_LONG");
+            stateTooLong = true;
         sent = true;
     }
 
     if (!sent)
         SendAddonPacket(player, replyType, "STATES", "");
+    else if (stateTooLong)
+        SendProtocolError(player, replyType, "GET", "STATES", "", "STATE_TOO_LONG");
 }
 
 std::string BuildStatsPayload(Player* player, std::string const& botName)
