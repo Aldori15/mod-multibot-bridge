@@ -34,6 +34,8 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <chrono>
+#include <deque>
 #include <limits>
 #include <map>
 #include <set>
@@ -58,6 +60,15 @@ std::size_t constexpr kMaxBotNameLength = 64;
 std::size_t constexpr kMaxTokenLength = 64;
 std::size_t constexpr kMaxEncodedFieldLength = 192;
 std::size_t constexpr kMaxCommandLength = 160;
+std::size_t constexpr kMaxStateBots = 128;
+std::size_t constexpr kMaxStateStrategiesPerScope = 256;
+std::size_t constexpr kMaxStrategyOperations = 32;
+std::size_t constexpr kMaxStrategyNameLength = 96;
+std::size_t constexpr kMaxStrategyMatchedBots = 128;
+std::size_t constexpr kStrategyMutationRateLimit = 24;
+std::chrono::milliseconds constexpr kStrategyMutationRateWindow(2000);
+char const* const kStateFramingCapability = "STATE_FRAMING_V1";
+char const* const kStrategyMutationCapability = "STRATEGY_MUTATION_V1";
 uint32 constexpr kMaxItemActionCount = 1000;
 
 enum class BridgePayloadStatus
@@ -76,6 +87,7 @@ Player* FindBotByName(Player* player, std::string const& botName);
 PlayerbotAI* GetBotAI(Player* bot);
 std::vector<Player*> GetBridgeVisibleBots(Player* player);
 void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload = "");
+bool SendStateAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload);
 bool SendProtocolError(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& requestType, std::string const& token, std::string const& reason);
 void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void SendTrainerPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
@@ -109,6 +121,19 @@ std::string ToLower(std::string value)
 {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return std::tolower(c); });
     return value;
+}
+
+std::size_t GetAddonWireLength(std::string const& opcode, std::string const& payload)
+{
+    std::size_t length = std::char_traits<char>::length(kAddonEnvelope) + opcode.size();
+    if (!payload.empty())
+        length += 1 + payload.size();
+    return length;
+}
+
+bool IsAddonPacketWithinBudget(std::string const& opcode, std::string const& payload)
+{
+    return GetAddonWireLength(opcode, payload) <= kMaxBridgeWireLength;
 }
 
 std::pair<std::string, std::string> SplitOnce(std::string const& value, char separator)
@@ -3925,6 +3950,296 @@ bool BotMatchesCombatScope(Player* requester, Player* bot, std::string const& sc
     return BotMatchesRTIScope(requester, bot, scope, target);
 }
 
+struct StrategyMutationOperation
+{
+    bool enable = false;
+    std::string name;
+};
+
+struct StrategyMutationRateState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+};
+
+std::map<std::string, StrategyMutationRateState> sStrategyMutationRateStates;
+
+bool IsValidStrategyName(std::string const& name)
+{
+    if (name.empty() || name.size() > kMaxStrategyNameLength || name != Trim(name))
+        return false;
+
+    for (unsigned char const c : name)
+    {
+        if (!std::isalnum(c) && c != ' ' && c != '-' && c != '_' && c != '\'')
+            return false;
+    }
+
+    return true;
+}
+
+bool TryNormalizeStrategyChanges(
+    std::string const& value,
+    std::string& normalized,
+    std::vector<StrategyMutationOperation>& operations,
+    std::string& reason)
+{
+    normalized.clear();
+    operations.clear();
+    reason.clear();
+
+    std::string const changes = Trim(value);
+    if (changes.empty() || changes.size() > kMaxCommandLength)
+    {
+        reason = "BAD_CHANGES";
+        return false;
+    }
+
+    std::size_t start = 0;
+    while (true)
+    {
+        std::size_t const separator = changes.find(',', start);
+        std::string const rawOperation =
+            separator == std::string::npos ? changes.substr(start) : changes.substr(start, separator - start);
+        std::string const operation = Trim(rawOperation);
+
+        if (operation.size() < 2 || (operation[0] != '+' && operation[0] != '-'))
+        {
+            reason = "BAD_OPERATION";
+            return false;
+        }
+
+        std::string const name = ToLower(Trim(operation.substr(1)));
+        if (!IsValidStrategyName(name))
+        {
+            reason = "BAD_STRATEGY";
+            return false;
+        }
+
+        operations.push_back({operation[0] == '+', name});
+        if (operations.size() > kMaxStrategyOperations)
+        {
+            reason = "TOO_MANY_OPERATIONS";
+            return false;
+        }
+
+        if (!normalized.empty())
+            normalized.push_back(',');
+        normalized.push_back(operation[0]);
+        normalized += name;
+
+        if (separator == std::string::npos)
+            break;
+
+        start = separator + 1;
+    }
+
+    if (operations.empty())
+    {
+        reason = "BAD_CHANGES";
+        return false;
+    }
+
+    reason = "OK";
+    return true;
+}
+
+bool ConsumeStrategyMutationRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+    StrategyMutationRateState& state = sStrategyMutationRateStates[key];
+
+    while (!state.requests.empty() && now - state.requests.front() >= kStrategyMutationRateWindow)
+        state.requests.pop_front();
+
+    if (state.requests.size() >= kStrategyMutationRateLimit)
+        return false;
+
+    state.requests.push_back(now);
+
+    if (sStrategyMutationRateStates.size() > 512)
+    {
+        for (auto it = sStrategyMutationRateStates.begin(); it != sStrategyMutationRateStates.end();)
+        {
+            while (!it->second.requests.empty() && now - it->second.requests.front() >= kStrategyMutationRateWindow)
+                it->second.requests.pop_front();
+
+            if (it->second.requests.empty() && it->first != key)
+                it = sStrategyMutationRateStates.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    return true;
+}
+
+bool VerifyStrategyMutationResult(
+    PlayerbotAI* botAI,
+    BotState botState,
+    std::vector<StrategyMutationOperation> const& operations)
+{
+    if (!botAI)
+        return false;
+
+    for (StrategyMutationOperation const& operation : operations)
+    {
+        if (botAI->HasStrategy(operation.name, botState) != operation.enable)
+            return false;
+    }
+
+    return true;
+}
+
+bool ApplyNativeStrategyMutation(
+    Player* requester,
+    Player* bot,
+    std::string const& actionName,
+    BotState botState,
+    std::string const& changes,
+    std::vector<StrategyMutationOperation> const& operations)
+{
+    if (!requester || !bot)
+        return false;
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+    {
+        return false;
+    }
+
+    if (!botAI->DoSpecificAction(actionName, Event(actionName, changes, requester), true))
+        return false;
+
+    return VerifyStrategyMutationResult(botAI, botState, operations);
+}
+
+void SendStrategyMutationAck(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& scope,
+    std::string const& target,
+    std::string const& token,
+    std::string const& stateScope,
+    uint32 matched,
+    uint32 succeeded,
+    uint32 failed,
+    std::string const& reason)
+{
+    std::ostringstream payload;
+    payload << scope
+        << kFieldSeparator << UrlEncodeField(target)
+        << kFieldSeparator << token
+        << kFieldSeparator << stateScope
+        << kFieldSeparator << matched
+        << kFieldSeparator << succeeded
+        << kFieldSeparator << failed
+        << kFieldSeparator << UrlEncodeField(reason);
+
+    if (SendStateAddonPacket(requester, replyType, "STRATEGY_ACK", payload.str()))
+        return;
+
+    std::ostringstream fallbackPayload;
+    fallbackPayload << scope
+        << kFieldSeparator
+        << kFieldSeparator << token
+        << kFieldSeparator << stateScope
+        << kFieldSeparator << 0
+        << kFieldSeparator << 0
+        << kFieldSeparator << 0
+        << kFieldSeparator << "ACK_TOO_LONG";
+    SendStateAddonPacket(requester, replyType, "STRATEGY_ACK", fallbackPayload.str());
+}
+
+void RunStrategyMutationCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& scopeValue,
+    std::string const& encodedTarget,
+    std::string const& requestToken,
+    std::string const& stateScopeValue,
+    std::string const& encodedChanges)
+{
+    std::string const scope = ToUpper(Trim(scopeValue));
+    std::string target;
+    std::string rawChanges;
+    std::string const token = Trim(requestToken);
+    std::string const stateScope = ToUpper(Trim(stateScopeValue));
+    uint32 matched = 0;
+    uint32 succeeded = 0;
+    uint32 failed = 0;
+    bool botLimitExceeded = false;
+    std::string reason = "OK";
+
+    if (!TryUrlDecodeField(encodedTarget, target, kMaxBotNameLength, true) ||
+        !TryUrlDecodeField(encodedChanges, rawChanges, kMaxCommandLength, false))
+    {
+        SendStrategyMutationAck(requester, replyType, scope, "", token, stateScope, 0, 0, 0, "BAD_ENCODING");
+        return;
+    }
+
+    target = Trim(target);
+    std::string normalizedChanges;
+    std::vector<StrategyMutationOperation> operations;
+    if (!TryNormalizeStrategyChanges(rawChanges, normalizedChanges, operations, reason))
+    {
+        SendStrategyMutationAck(requester, replyType, scope, target, token, stateScope, 0, 0, 0, reason);
+        return;
+    }
+
+    if (!ConsumeStrategyMutationRateLimit(requester))
+    {
+        SendStrategyMutationAck(requester, replyType, scope, target, token, stateScope, 0, 0, 0, "RATE_LIMIT");
+        return;
+    }
+
+    BotState const botState = stateScope == "C" ? BOT_STATE_COMBAT : BOT_STATE_NON_COMBAT;
+    std::string const actionName = stateScope == "C" ? "co" : "nc";
+
+    for (Player* const bot : GetBridgeVisibleBots(requester))
+    {
+        if (!BotMatchesCombatScope(requester, bot, scope, target))
+            continue;
+
+        if (matched >= kMaxStrategyMatchedBots)
+        {
+            botLimitExceeded = true;
+            continue;
+        }
+
+        ++matched;
+        if (ApplyNativeStrategyMutation(requester, bot, actionName, botState, normalizedChanges, operations))
+            ++succeeded;
+        else
+            ++failed;
+    }
+
+    if (matched == 0)
+        reason = "NO_MATCH";
+    else if (botLimitExceeded)
+        reason = "BOT_LIMIT";
+    else if (failed > 0 && succeeded > 0)
+        reason = "PARTIAL";
+    else if (failed > 0)
+        reason = "FAILED";
+
+    SendStrategyMutationAck(
+        requester,
+        replyType,
+        scope,
+        target,
+        token,
+        stateScope,
+        matched,
+        succeeded,
+        failed,
+        reason);
+}
+
 bool IsAllowedFormationName(std::string const& formation)
 {
     static std::set<std::string> const allowed =
@@ -4236,6 +4551,29 @@ void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode
     player->SendDirectMessage(&data);
 }
 
+bool SendStateAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload)
+{
+    if (!player || !player->GetSession())
+        return false;
+
+    std::size_t const wireLength = GetAddonWireLength(opcode, payload);
+    if (wireLength > kMaxBridgeWireLength)
+    {
+        LOG_INFO(
+            "playerbots",
+            "MultiBotBridge STATE TX rejected player={} opcode={} payloadBytes={} wireBytes={} maxWireBytes={}",
+            player->GetName(),
+            SanitizeLogValue(opcode, kMaxOpcodeLength),
+            payload.size(),
+            wireLength,
+            kMaxBridgeWireLength);
+        return false;
+    }
+
+    SendAddonPacket(player, chatType, opcode, payload);
+    return true;
+}
+
 bool SendProtocolError(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& requestType, std::string const& token, std::string const& reason)
 {
     std::string const safeOpcode = IsValidProtocolName(opcode, kMaxOpcodeLength) ? ToUpper(opcode) : "";
@@ -4467,6 +4805,160 @@ std::string BuildStatePayload(Player* player, std::string const& botName)
     return out.str();
 }
 
+void SendStateAbort(Player* player, ChatMsg replyType, std::string const& token, std::string const& botName, std::string const& reason)
+{
+    std::ostringstream payload;
+    payload << token << kFieldSeparator << UrlEncodeField(botName) << kFieldSeparator << UrlEncodeField(reason);
+    SendStateAddonPacket(player, replyType, "STATE_ABORT", payload.str());
+}
+
+bool AppendStateFramePacket(
+    std::vector<std::pair<std::string, std::string>>& packets,
+    std::string const& opcode,
+    std::string const& payload,
+    std::string& reason)
+{
+    if (!IsAddonPacketWithinBudget(opcode, payload))
+    {
+        reason = "PACKET_TOO_LONG";
+        return false;
+    }
+
+    packets.emplace_back(opcode, payload);
+    return true;
+}
+
+bool AppendStateFramesForBot(
+    std::vector<std::pair<std::string, std::string>>& packets,
+    std::string const& token,
+    Player* bot,
+    std::string& reason)
+{
+    if (!bot)
+    {
+        reason = "NO_BOT";
+        return false;
+    }
+
+    PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+    std::vector<std::string> combatStrategies;
+    std::vector<std::string> nonCombatStrategies;
+    if (botAI)
+    {
+        combatStrategies = botAI->GetStrategies(BOT_STATE_COMBAT);
+        nonCombatStrategies = botAI->GetStrategies(BOT_STATE_NON_COMBAT);
+    }
+
+    if (combatStrategies.size() > kMaxStateStrategiesPerScope || nonCombatStrategies.size() > kMaxStateStrategiesPerScope)
+    {
+        reason = "TOO_MANY_STRATEGIES";
+        return false;
+    }
+
+    std::string const encodedBotName = UrlEncodeField(bot->GetName());
+    std::ostringstream beginPayload;
+    beginPayload << token << kFieldSeparator << encodedBotName << kFieldSeparator << combatStrategies.size() << kFieldSeparator
+        << nonCombatStrategies.size();
+    if (!AppendStateFramePacket(packets, "STATE_BEGIN", beginPayload.str(), reason))
+        return false;
+
+    for (std::size_t index = 0; index < combatStrategies.size(); ++index)
+    {
+        std::ostringstream itemPayload;
+        itemPayload << token << kFieldSeparator << encodedBotName << kFieldSeparator << 'C' << kFieldSeparator << (index + 1)
+            << kFieldSeparator << UrlEncodeField(combatStrategies[index]);
+        if (!AppendStateFramePacket(packets, "STATE_ITEM", itemPayload.str(), reason))
+            return false;
+    }
+
+    for (std::size_t index = 0; index < nonCombatStrategies.size(); ++index)
+    {
+        std::ostringstream itemPayload;
+        itemPayload << token << kFieldSeparator << encodedBotName << kFieldSeparator << 'N' << kFieldSeparator << (index + 1)
+            << kFieldSeparator << UrlEncodeField(nonCombatStrategies[index]);
+        if (!AppendStateFramePacket(packets, "STATE_ITEM", itemPayload.str(), reason))
+            return false;
+    }
+
+    std::ostringstream endPayload;
+    endPayload << token << kFieldSeparator << encodedBotName << kFieldSeparator << combatStrategies.size() << kFieldSeparator
+        << nonCombatStrategies.size();
+    return AppendStateFramePacket(packets, "STATE_END", endPayload.str(), reason);
+}
+
+bool SendPreparedStatePackets(
+    Player* player,
+    ChatMsg replyType,
+    std::vector<std::pair<std::string, std::string>> const& packets)
+{
+    for (auto const& packet : packets)
+        if (!SendStateAddonPacket(player, replyType, packet.first, packet.second))
+            return false;
+
+    return true;
+}
+
+void SendFramedStatePacket(Player* player, ChatMsg replyType, std::string const& botName, std::string const& token)
+{
+    Player* const bot = FindBotByName(player, botName);
+    if (!bot)
+    {
+        SendStateAbort(player, replyType, token, botName, "NO_BOT");
+        return;
+    }
+
+    std::vector<std::pair<std::string, std::string>> packets;
+    std::string reason;
+    if (!AppendStateFramesForBot(packets, token, bot, reason))
+    {
+        SendStateAbort(player, replyType, token, bot->GetName(), reason);
+        return;
+    }
+
+    if (!SendPreparedStatePackets(player, replyType, packets))
+        SendStateAbort(player, replyType, token, bot->GetName(), "SEND_FAILED");
+}
+
+void SendFramedStatePackets(Player* player, ChatMsg replyType, std::string const& token)
+{
+    std::vector<Player*> const bots = GetBridgeVisibleBots(player);
+    if (bots.size() > kMaxStateBots)
+    {
+        SendStateAbort(player, replyType, token, "", "TOO_MANY_BOTS");
+        return;
+    }
+
+    std::vector<std::pair<std::string, std::string>> packets;
+    std::string reason;
+    std::ostringstream beginPayload;
+    beginPayload << token << kFieldSeparator << bots.size();
+    if (!AppendStateFramePacket(packets, "STATES_BEGIN", beginPayload.str(), reason))
+    {
+        SendStateAbort(player, replyType, token, "", reason);
+        return;
+    }
+
+    for (Player* const bot : bots)
+    {
+        if (!AppendStateFramesForBot(packets, token, bot, reason))
+        {
+            SendStateAbort(player, replyType, token, bot ? bot->GetName() : "", reason);
+            return;
+        }
+    }
+
+    std::ostringstream endPayload;
+    endPayload << token << kFieldSeparator << bots.size();
+    if (!AppendStateFramePacket(packets, "STATES_END", endPayload.str(), reason))
+    {
+        SendStateAbort(player, replyType, token, "", reason);
+        return;
+    }
+
+    if (!SendPreparedStatePackets(player, replyType, packets))
+        SendStateAbort(player, replyType, token, "", "SEND_FAILED");
+}
+
 void SendStatePackets(Player* player, ChatMsg replyType)
 {
     bool sent = false;
@@ -4484,7 +4976,8 @@ void SendStatePackets(Player* player, ChatMsg replyType)
 
         std::ostringstream out;
         out << bot->GetName() << kFieldSeparator << combatStrategies << kFieldSeparator << nonCombatStrategies;
-        SendAddonPacket(player, replyType, "STATE", out.str());
+        if (!SendStateAddonPacket(player, replyType, "STATE", out.str()))
+            SendProtocolError(player, replyType, "GET", "STATES", "", "STATE_TOO_LONG");
         sent = true;
     }
 
@@ -4525,6 +5018,11 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             return SendProtocolError(player, replyType, normalized, "", "", "BAD_VERSION");
 
         SendAddonPacket(player, replyType, "HELLO_ACK", std::string(kProtocolVersion) + kFieldSeparator + kBridgeName);
+        SendAddonPacket(
+            player,
+            replyType,
+            "CAPS",
+            std::string(kStateFramingCapability) + "," + kStrategyMutationCapability);
         return true;
     }
 
@@ -4609,22 +5107,46 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
 
         if (requestType == "STATE")
         {
-            if (fields.size() != 2)
-                return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_FIELD_COUNT");
+            if (fields.size() == 2)
+            {
+                if (!IsValidCanonicalRawField(fields[1], kMaxBotNameLength, false))
+                    return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_BOT_NAME");
 
-            if (!IsValidCanonicalRawField(fields[1], kMaxBotNameLength, false))
-                return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_BOT_NAME");
+                std::string const legacyPayload = BuildStatePayload(player, fields[1]);
+                if (!SendStateAddonPacket(player, replyType, "STATE", legacyPayload))
+                    return SendProtocolError(player, replyType, normalized, requestType, "", "STATE_TOO_LONG");
+                return true;
+            }
 
-            SendAddonPacket(player, replyType, "STATE", BuildStatePayload(player, fields[1]));
+            std::string const token = GetSafeErrorToken(fields, 2);
+            if (fields.size() != 3)
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+            std::string botName;
+            if (!TryUrlDecodeField(fields[1], botName, kMaxBotNameLength, false))
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+            if (!IsValidRequestToken(fields[2]))
+                return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+            SendFramedStatePacket(player, replyType, botName, fields[2]);
             return true;
         }
 
         if (requestType == "STATES")
         {
-            if (fields.size() != 1)
-                return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_FIELD_COUNT");
+            if (fields.size() == 1)
+            {
+                SendStatePackets(player, replyType);
+                return true;
+            }
 
-            SendStatePackets(player, replyType);
+            std::string const token = GetSafeErrorToken(fields, 1);
+            if (fields.size() != 2)
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+            if (!IsValidRequestToken(fields[1]))
+                return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+            SendFramedStatePackets(player, replyType, fields[1]);
             return true;
         }
 
@@ -4895,6 +5417,43 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         }
 
         RunInventoryItemActionCommand(player, replyType, fields[1], fields[2], fields[3], fields[4], fields[5]);
+        return true;
+    }
+
+    if (requestType == "STRATEGY")
+    {
+        std::string const token = GetSafeErrorToken(fields, 3);
+        if (fields.size() != 6)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        std::string const scope = ToUpper(fields[1]);
+        if ((scope != "ALL" && scope != "RAID" && scope != "GROUP" && scope != "PARTY" && scope != "BOT") ||
+            fields[1] != scope)
+        {
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_SCOPE");
+        }
+
+        if (!IsValidEncodedField(fields[2], kMaxBotNameLength, true))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_ENCODING");
+
+        std::string decodedTarget;
+        if (!TryUrlDecodeField(fields[2], decodedTarget, kMaxBotNameLength, true) ||
+            (scope == "BOT" && Trim(decodedTarget).empty()) ||
+            (scope != "BOT" && !Trim(decodedTarget).empty()))
+        {
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_TARGET");
+        }
+
+        if (!IsValidRequestToken(fields[3]))
+            return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        if (fields[4] != "C" && fields[4] != "N")
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_STATE");
+
+        if (!IsValidEncodedField(fields[5], kMaxCommandLength, false))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_ENCODING");
+
+        RunStrategyMutationCommand(player, replyType, fields[1], fields[2], fields[3], fields[4], fields[5]);
         return true;
     }
 
