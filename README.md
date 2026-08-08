@@ -321,6 +321,12 @@ Addon  -> Server: MBOT GET~FORMATIONS~GROUP~~<token>
 Server -> Addon:  MBOT FORMATIONS_BEGIN~<token>~<count>
 Server -> Addon:  MBOT FORMATIONS_ITEM~<token>~<botName>~<formation>
 Server -> Addon:  MBOT FORMATIONS_END~<token>~<sentCount>
+
+Addon  -> Server: MBOT RUN~STRATEGY~<scope>~<target>~<token>~<stateScope>~<changes>
+Server -> Addon:  MBOT STRATEGY_ACK~<scope>~<target>~<token>~<stateScope>~<matched>~<succeeded>~<failed>~<reason>
+
+Addon  -> Server: MBOT GET~WEAPON_ENCHANT~<botName>~<token>
+Server -> Addon:  MBOT WEAPON_ENCHANT~<token>~<botName>~<status>~<mhItem>~<mhEnchant>~<mhDuration>~<ohItem>~<ohEnchant>~<ohDuration>
 ```
 
 The exact payloads are consumed internally by the MultiBot addon.
@@ -385,6 +391,10 @@ hardening change does not fragment existing server responses.
   <tr>
     <td><code>GET~STATES</code></td>
     <td>Refresh bot state flags and UI state data.</td>
+  </tr>
+  <tr>
+    <td><code>GET~WEAPON_ENCHANT</code> / <code>WEAPON_ENCHANT</code></td>
+    <td>On-demand diagnostic read of main-hand/off-hand item entries, temporary enchant IDs and remaining durations for one visible, controllable bot. The endpoint is rate-limited and is not a polling path.</td>
   </tr>
   <tr>
     <td><code>GET~FORMATIONS</code></td>
@@ -491,6 +501,10 @@ hardening change does not fragment existing server responses.
     <td>Apply one validated formation to every controllable bot in the player's current party or raid and return aggregate success/failure counts.</td>
   </tr>
   <tr>
+    <td><code>RUN~STRATEGY</code> / <code>STRATEGY_ACK</code></td>
+    <td>Apply bounded structured <code>co/nc</code> strategy mutations, verify the resulting bot strategy state, and return matched/succeeded/failed counts plus a structured reason.</td>
+  </tr>
+  <tr>
     <td><code>RUN~LOOT</code></td>
     <td>Run whitelist-only loot rules and loot list commands without addon-side chat parsing.</td>
   </tr>
@@ -517,6 +531,22 @@ ss ?
 The bridge only replaces the automatic data-refresh paths used by the addon UI.
 
 Formation selection and inspection are also bridge-first. `RUN~FORMATION` applies a validated formation across the whole current party or raid, while `GET~FORMATIONS` reads the effective value from each controllable bot. Neither path requires PARTY, RAID, whisper or `TellMaster` output. The `GROUP` scope intentionally covers the complete party or raid; individual raid subgroups are not targeted.
+
+## Warlock strategy selectors and stone switching
+
+The migrated Warlock Stones, Soulstones, Pets and Curses selectors use `RUN~STRATEGY` rather than direct automatic selector whispers. The bridge verifies strategy mutations before returning `STRATEGY_ACK`, allowing the addon to refresh selector state from authoritative server `STATE` data.
+
+Firestone/Spellstone switching needs one additional bridge-side guard because Playerbots normally refuses to use a spell item on a weapon whose `TEMP_ENCHANTMENT_SLOT` is already occupied. For a real exclusive non-combat switch on a controllable Warlock, the bridge:
+
+1. reads the current main-hand temporary enchant;
+2. discovers the temporary-enchant IDs exposed by Firestone/Spellstone items actually carried by the bot;
+3. refuses to clear the slot when the current enchant is not recognized as one of those Warlock stone enchants;
+4. removes the recognized old enchant effects and clears the temporary slot;
+5. reuses the existing Playerbots `firestone` or `spellstone` action instead of duplicating spell/item logic.
+
+No Firestone/Spellstone enchant ID is hardcoded by this switch path, and `mod-playerbots` does not need to be modified.
+
+For targeted verification, `GET~WEAPON_ENCHANT` / `WEAPON_ENCHANT` exposes an on-demand diagnostic snapshot of the equipped weapon temporary-enchant state. It checks bot visibility/control security and applies a 500 ms per-requester rate limit. It is not used for automatic polling.
 
 ---
 

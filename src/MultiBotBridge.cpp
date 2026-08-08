@@ -4098,6 +4098,250 @@ bool VerifyStrategyMutationResult(
     return true;
 }
 
+void CollectCarriedWarlockStoneEnchantIds(Item* item, std::set<uint32>& enchantIds)
+{
+    if (!item)
+        return;
+
+    ItemTemplate const* const proto = item->GetTemplate();
+    if (!proto)
+        return;
+
+    std::string const itemName = ToLower(proto->Name1);
+    if (itemName.find("firestone") == std::string::npos && itemName.find("spellstone") == std::string::npos)
+        return;
+
+    for (uint8 spellIndex = 0; spellIndex < MAX_ITEM_PROTO_SPELLS; ++spellIndex)
+    {
+        uint32 const spellId = proto->Spells[spellIndex].SpellId;
+        if (!spellId)
+            continue;
+
+        SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(spellId);
+        if (!spellInfo)
+            continue;
+
+        for (uint8 effectIndex = 0; effectIndex < MAX_SPELL_EFFECTS; ++effectIndex)
+        {
+            SpellEffectInfo const& effect = spellInfo->Effects[effectIndex];
+            if (effect.Effect == SPELL_EFFECT_ENCHANT_ITEM_TEMPORARY && effect.MiscValue > 0)
+                enchantIds.insert(static_cast<uint32>(effect.MiscValue));
+        }
+    }
+}
+
+std::set<uint32> GetCarriedWarlockStoneEnchantIds(Player* bot)
+{
+    std::set<uint32> enchantIds;
+    if (!bot)
+        return enchantIds;
+
+    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        CollectCarriedWarlockStoneEnchantIds(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot), enchantIds);
+
+    for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+    {
+        Bag* const pBag = static_cast<Bag*>(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, bag));
+        if (!pBag)
+            continue;
+
+        for (uint8 slot = 0; slot < pBag->GetBagSize(); ++slot)
+            CollectCarriedWarlockStoneEnchantIds(pBag->GetItemByPos(slot), enchantIds);
+    }
+
+    return enchantIds;
+}
+
+enum class WarlockStoneSwitchResult
+{
+    NotRequired,
+    Applied,
+    Failed
+};
+
+bool IsWarlockStoneStrategyMutation(
+    Player* bot,
+    BotState botState,
+    std::vector<StrategyMutationOperation> const& operations)
+{
+    if (!bot || botState != BOT_STATE_NON_COMBAT || bot->getClass() != CLASS_WARLOCK)
+        return false;
+
+    for (StrategyMutationOperation const& operation : operations)
+    {
+        if (operation.name == "firestone" || operation.name == "spellstone")
+            return true;
+    }
+
+    return false;
+}
+
+std::map<std::string, bool> CaptureStrategyMutationState(
+    PlayerbotAI* botAI,
+    BotState botState,
+    std::vector<StrategyMutationOperation> const& operations)
+{
+    std::map<std::string, bool> states;
+    if (!botAI)
+        return states;
+
+    for (StrategyMutationOperation const& operation : operations)
+    {
+        if (states.find(operation.name) == states.end())
+            states.emplace(operation.name, botAI->HasStrategy(operation.name, botState));
+    }
+
+    return states;
+}
+
+bool RollbackNativeStrategyMutation(
+    Player* requester,
+    PlayerbotAI* botAI,
+    std::string const& actionName,
+    BotState botState,
+    std::map<std::string, bool> const& priorStates)
+{
+    if (!requester || !botAI)
+        return false;
+
+    if (priorStates.empty())
+        return true;
+
+    std::ostringstream changes;
+    std::vector<StrategyMutationOperation> rollbackOperations;
+    bool first = true;
+
+    for (auto const& priorState : priorStates)
+    {
+        if (!first)
+            changes << ',';
+
+        changes << (priorState.second ? '+' : '-') << priorState.first;
+        rollbackOperations.push_back({priorState.second, priorState.first});
+        first = false;
+    }
+
+    if (!botAI->DoSpecificAction(actionName, Event(actionName, changes.str(), requester), true))
+        return false;
+
+    return VerifyStrategyMutationResult(botAI, botState, rollbackOperations);
+}
+
+WarlockStoneSwitchResult TryForceWarlockStoneSwitch(
+    Player* requester,
+    Player* bot,
+    PlayerbotAI* botAI,
+    BotState botState,
+    bool hadFirestoneStrategy,
+    bool hadSpellstoneStrategy)
+{
+    if (!requester || !bot || !botAI || botState != BOT_STATE_NON_COMBAT || bot->getClass() != CLASS_WARLOCK)
+        return WarlockStoneSwitchResult::NotRequired;
+
+    bool const hasFirestoneStrategy = botAI->HasStrategy("firestone", BOT_STATE_NON_COMBAT);
+    bool const hasSpellstoneStrategy = botAI->HasStrategy("spellstone", BOT_STATE_NON_COMBAT);
+
+    std::string desiredStone;
+    if (!hadFirestoneStrategy && hadSpellstoneStrategy && hasFirestoneStrategy && !hasSpellstoneStrategy)
+        desiredStone = "firestone";
+    else if (hadFirestoneStrategy && !hadSpellstoneStrategy && !hasFirestoneStrategy && hasSpellstoneStrategy)
+        desiredStone = "spellstone";
+    else
+        return WarlockStoneSwitchResult::NotRequired;
+
+    Item* const mainHand = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+    if (!mainHand)
+        return WarlockStoneSwitchResult::NotRequired;
+
+    uint32 const currentEnchantId = mainHand->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT);
+    if (!currentEnchantId)
+        return WarlockStoneSwitchResult::NotRequired;
+
+    std::set<uint32> const carriedStoneEnchantIds = GetCarriedWarlockStoneEnchantIds(bot);
+    if (carriedStoneEnchantIds.find(currentEnchantId) == carriedStoneEnchantIds.end())
+    {
+        if (BridgeConsoleLogsEnabled())
+        {
+            LOG_INFO(
+                "playerbots",
+                "MultiBotBridge warlock stone switch skipped bot={} requested={} currentEnchant={} reason=UNRECOGNIZED_TEMP_ENCHANT",
+                bot->GetName(),
+                desiredStone,
+                currentEnchantId);
+        }
+        return WarlockStoneSwitchResult::NotRequired;
+    }
+
+    uint32 const currentEnchantDuration = mainHand->GetEnchantmentDuration(TEMP_ENCHANTMENT_SLOT);
+    uint32 const currentEnchantCharges = mainHand->GetEnchantmentCharges(TEMP_ENCHANTMENT_SLOT);
+
+    // stateScope N selects the non-combat strategy bucket; it is not a runtime combat-state guarantee.
+    // Re-check immediately before touching the equipped enchantment to close the race after the pre-mutation guard.
+    if (bot->IsInCombat())
+    {
+        if (BridgeConsoleLogsEnabled())
+        {
+            LOG_INFO(
+                "playerbots",
+                "MultiBotBridge warlock stone switch skipped bot={} requested={} currentEnchant={} reason=RUNTIME_COMBAT_BEFORE_ENCHANT_CLEAR",
+                bot->GetName(),
+                desiredStone,
+                currentEnchantId);
+        }
+        return WarlockStoneSwitchResult::Failed;
+    }
+
+    bot->ApplyEnchantment(mainHand, TEMP_ENCHANTMENT_SLOT, false);
+    mainHand->ClearEnchantment(TEMP_ENCHANTMENT_SLOT);
+
+    bool const applied = botAI->DoSpecificAction(desiredStone, Event(), true);
+    if (!applied)
+    {
+        // Restore the exact persistent temporary-enchant fields and re-apply its equipped effects/duration tracking.
+        mainHand->SetEnchantment(
+            TEMP_ENCHANTMENT_SLOT,
+            currentEnchantId,
+            currentEnchantDuration,
+            currentEnchantCharges,
+            bot->GetGUID());
+        bot->ApplyEnchantment(mainHand, TEMP_ENCHANTMENT_SLOT, true);
+
+        bool const restored =
+            mainHand->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT) == currentEnchantId &&
+            mainHand->GetEnchantmentDuration(TEMP_ENCHANTMENT_SLOT) == currentEnchantDuration &&
+            mainHand->GetEnchantmentCharges(TEMP_ENCHANTMENT_SLOT) == currentEnchantCharges;
+
+        if (BridgeConsoleLogsEnabled())
+        {
+            LOG_INFO(
+                "playerbots",
+                "MultiBotBridge warlock stone switch failed bot={} requested={} previousEnchant={} previousDuration={} previousCharges={} enchantRestored={}",
+                bot->GetName(),
+                desiredStone,
+                currentEnchantId,
+                currentEnchantDuration,
+                currentEnchantCharges,
+                restored);
+        }
+
+        return WarlockStoneSwitchResult::Failed;
+    }
+
+    if (BridgeConsoleLogsEnabled())
+    {
+        LOG_INFO(
+            "playerbots",
+            "MultiBotBridge warlock stone switch bot={} requested={} previousEnchant={} applied={} resultingEnchant={}",
+            bot->GetName(),
+            desiredStone,
+            currentEnchantId,
+            applied,
+            mainHand->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT));
+    }
+
+    return WarlockStoneSwitchResult::Applied;
+}
+
 bool ApplyNativeStrategyMutation(
     Player* requester,
     Player* bot,
@@ -4116,12 +4360,65 @@ bool ApplyNativeStrategyMutation(
         return false;
     }
 
+    bool const isWarlockStoneMutation = IsWarlockStoneStrategyMutation(bot, botState, operations);
+    if (isWarlockStoneMutation && bot->IsInCombat())
+    {
+        if (BridgeConsoleLogsEnabled())
+        {
+            LOG_INFO(
+                "playerbots",
+                "MultiBotBridge warlock stone strategy mutation rejected bot={} reason=RUNTIME_COMBAT_BEFORE_MUTATION",
+                bot->GetName());
+        }
+        return false;
+    }
+
+    std::map<std::string, bool> priorStrategyStates;
+    if (isWarlockStoneMutation)
+        priorStrategyStates = CaptureStrategyMutationState(botAI, botState, operations);
+
+    bool const hadFirestoneStrategy =
+        botState == BOT_STATE_NON_COMBAT && botAI->HasStrategy("firestone", BOT_STATE_NON_COMBAT);
+    bool const hadSpellstoneStrategy =
+        botState == BOT_STATE_NON_COMBAT && botAI->HasStrategy("spellstone", BOT_STATE_NON_COMBAT);
+
     if (!botAI->DoSpecificAction(actionName, Event(actionName, changes, requester), true))
         return false;
 
-    return VerifyStrategyMutationResult(botAI, botState, operations);
-}
+    if (!VerifyStrategyMutationResult(botAI, botState, operations))
+        return false;
 
+    WarlockStoneSwitchResult const stoneSwitchResult = TryForceWarlockStoneSwitch(
+        requester,
+        bot,
+        botAI,
+        botState,
+        hadFirestoneStrategy,
+        hadSpellstoneStrategy);
+
+    if (stoneSwitchResult == WarlockStoneSwitchResult::Failed)
+    {
+        bool const strategyRollbackSucceeded = RollbackNativeStrategyMutation(
+            requester,
+            botAI,
+            actionName,
+            botState,
+            priorStrategyStates);
+
+        if (BridgeConsoleLogsEnabled())
+        {
+            LOG_INFO(
+                "playerbots",
+                "MultiBotBridge warlock stone strategy rollback bot={} succeeded={}",
+                bot->GetName(),
+                strategyRollbackSucceeded);
+        }
+
+        return false;
+    }
+
+    return true;
+}
 void SendStrategyMutationAck(
     Player* requester,
     ChatMsg replyType,
@@ -4680,6 +4977,100 @@ Player* FindBotByName(Player* player, std::string const& botName)
     }
 
     return nullptr;
+}
+
+bool ConsumeWeaponEnchantDebugRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    static std::map<std::string, std::chrono::steady_clock::time_point> lastRequests;
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+
+    auto const existing = lastRequests.find(key);
+    if (existing != lastRequests.end() && now - existing->second < std::chrono::milliseconds(500))
+        return false;
+
+    lastRequests[key] = now;
+
+    if (lastRequests.size() > 512)
+    {
+        for (auto it = lastRequests.begin(); it != lastRequests.end();)
+        {
+            if (it->first != key && now - it->second >= std::chrono::seconds(60))
+                it = lastRequests.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    return true;
+}
+
+void SendWeaponEnchantDebugPacket(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& botName,
+    std::string const& token)
+{
+    std::string status = "OK";
+    uint32 mainItem = 0;
+    uint32 mainEnchant = 0;
+    uint32 mainDuration = 0;
+    uint32 offItem = 0;
+    uint32 offEnchant = 0;
+    uint32 offDuration = 0;
+
+    Player* const bot = FindBotByName(requester, botName);
+    if (!ConsumeWeaponEnchantDebugRateLimit(requester))
+    {
+        status = "RATE_LIMIT";
+    }
+    else if (!bot)
+    {
+        status = "BOT_NOT_VISIBLE";
+    }
+    else
+    {
+        PlayerbotAI* const botAI = GetBotAI(bot);
+        if (!botAI || !botAI->GetSecurity() ||
+            !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+        {
+            status = "FORBIDDEN";
+        }
+        else
+        {
+            Item* const mainHand = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+            if (mainHand)
+            {
+                mainItem = mainHand->GetEntry();
+                mainEnchant = mainHand->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT);
+                mainDuration = mainHand->GetEnchantmentDuration(TEMP_ENCHANTMENT_SLOT);
+            }
+
+            Item* const offHand = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND);
+            if (offHand)
+            {
+                offItem = offHand->GetEntry();
+                offEnchant = offHand->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT);
+                offDuration = offHand->GetEnchantmentDuration(TEMP_ENCHANTMENT_SLOT);
+            }
+        }
+    }
+
+    std::ostringstream payload;
+    payload << token
+        << kFieldSeparator << UrlEncodeField(bot ? bot->GetName() : Trim(botName))
+        << kFieldSeparator << status
+        << kFieldSeparator << mainItem
+        << kFieldSeparator << mainEnchant
+        << kFieldSeparator << mainDuration
+        << kFieldSeparator << offItem
+        << kFieldSeparator << offEnchant
+        << kFieldSeparator << offDuration;
+
+    SendAddonPacket(requester, replyType, "WEAPON_ENCHANT", payload.str());
 }
 
 std::string JoinStrategies(std::vector<std::string> const& strategies)
@@ -5276,6 +5667,23 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
                     SendAddonPacket(player, replyType, "STATS", BuildStatsPayload(player, botName));
             }
 
+            return true;
+        }
+
+        if (requestType == "WEAPON_ENCHANT")
+        {
+            std::string const token = GetSafeErrorToken(fields, 2);
+            if (fields.size() != 3)
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+            std::string botName;
+            if (!TryUrlDecodeField(fields[1], botName, kMaxBotNameLength, false))
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+
+            if (!IsValidRequestToken(fields[2]))
+                return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+            SendWeaponEnchantDebugPacket(player, replyType, botName, fields[2]);
             return true;
         }
 
