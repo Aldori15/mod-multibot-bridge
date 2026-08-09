@@ -14,6 +14,7 @@
 #include "Player.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
+#include "PlayerbotRepository.h"
 #include "Playerbots.h"
 #include "RandomPlayerbotMgr.h"
 #include "ReputationMgr.h"
@@ -69,6 +70,7 @@ std::size_t constexpr kStrategyMutationRateLimit = 24;
 std::chrono::milliseconds constexpr kStrategyMutationRateWindow(2000);
 char const* const kStateFramingCapability = "STATE_FRAMING_V1";
 char const* const kStrategyMutationCapability = "STRATEGY_MUTATION_V1";
+char const* const kOutfitCapability = "OUTFIT_V1";
 uint32 constexpr kMaxItemActionCount = 1000;
 
 enum class BridgePayloadStatus
@@ -3023,17 +3025,7 @@ bool IsAllowedOutfitCommandSuffix(std::string const& suffix)
     return parts.action == "EQUIP" || parts.action == "REPLACE" || parts.action == "UPDATE" || parts.action == "RESET";
 }
 
-bool IsUpdateOutfitCommandSuffix(std::string const& suffix)
-{
-    OutfitCommandParts const parts = ParseOutfitCommandSuffix(suffix);
-    return parts.action == "UPDATE";
-}
 
-bool IsDirectBridgeOutfitCommandSuffix(std::string const& suffix)
-{
-    OutfitCommandParts const parts = ParseOutfitCommandSuffix(suffix);
-    return parts.action == "EQUIP" || parts.action == "REPLACE" || parts.action == "UPDATE" || parts.action == "RESET";
-}
 
 std::string SanitizeOutfitCommandSuffix(std::string suffix)
 {
@@ -3265,13 +3257,6 @@ bool ApplyBridgeNativeOutfitCommand(Player* bot, std::string const& suffix)
         if (!equippedAny)
             return false;
 
-        std::ostringstream out;
-        if (parts.action == "REPLACE")
-            out << "Replacing current equip with outfit " << parts.name;
-        else
-            out << "Equipping outfit " << parts.name;
-
-        botAI->TellMaster(out.str());
         return true;
     }
 
@@ -3281,11 +3266,21 @@ bool ApplyBridgeNativeOutfitCommand(Player* bot, std::string const& suffix)
         if (entries.empty())
             return false;
 
-        return SaveOutfitEntries(botAI, parts.name, entries);
+        if (!SaveOutfitEntries(botAI, parts.name, entries))
+            return false;
+
+        PlayerbotRepository::instance().Save(botAI);
+        return true;
     }
 
     if (parts.action == "RESET")
-        return SaveOutfitEntries(botAI, parts.name, std::vector<uint32>());
+    {
+        if (!SaveOutfitEntries(botAI, parts.name, std::vector<uint32>()))
+            return false;
+
+        PlayerbotRepository::instance().Save(botAI);
+        return true;
+    }
 
     return false;
 }
@@ -3683,17 +3678,11 @@ void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& b
     Player* const bot = FindBotByName(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
 
+    (void)persistToken;
+
     bool ok = false;
     if (bot && IsAllowedOutfitCommandSuffix(suffix))
-    {
-        if (IsDirectBridgeOutfitCommandSuffix(suffix))
-            ok = ApplyBridgeNativeOutfitCommand(bot, suffix);
-        else
-            ok = ExecuteSilentBotCommand(requester, bot, "outfit " + suffix);
-
-        if (ok && IsUpdateOutfitCommandSuffix(suffix) && Trim(persistToken) == "1")
-            ExecuteSilentBotCommand(requester, bot, "nc +chat");
-    }
+        ok = ApplyBridgeNativeOutfitCommand(bot, suffix);
 
     std::ostringstream payload;
     payload << UrlEncodeField(effectiveBotName)
@@ -5430,7 +5419,7 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             player,
             replyType,
             "CAPS",
-            std::string(kStateFramingCapability) + "," + kStrategyMutationCapability);
+            std::string(kStateFramingCapability) + "," + kStrategyMutationCapability + "," + kOutfitCapability);
         return true;
     }
 
