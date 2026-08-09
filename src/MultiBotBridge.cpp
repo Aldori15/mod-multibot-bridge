@@ -3094,7 +3094,7 @@ bool SaveOutfitEntries(PlayerbotAI* botAI, std::string const& outfitName, std::v
     return true;
 }
 
-bool ApplyBridgeNativeOutfitCommand(Player* bot, std::string const& suffix)
+bool ApplyBridgeNativeOutfitCommand(Player* bot, std::string const& suffix, bool persist)
 {
     if (!bot)
         return false;
@@ -3269,7 +3269,8 @@ bool ApplyBridgeNativeOutfitCommand(Player* bot, std::string const& suffix)
         if (!SaveOutfitEntries(botAI, parts.name, entries))
             return false;
 
-        PlayerbotRepository::instance().Save(botAI);
+        if (persist)
+            PlayerbotRepository::instance().Save(botAI);
         return true;
     }
 
@@ -3278,7 +3279,8 @@ bool ApplyBridgeNativeOutfitCommand(Player* bot, std::string const& suffix)
         if (!SaveOutfitEntries(botAI, parts.name, std::vector<uint32>()))
             return false;
 
-        PlayerbotRepository::instance().Save(botAI);
+        if (persist)
+            PlayerbotRepository::instance().Save(botAI);
         return true;
     }
 
@@ -3678,11 +3680,11 @@ void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& b
     Player* const bot = FindBotByName(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
 
-    (void)persistToken;
+    bool const persist = persistToken == "1";
 
     bool ok = false;
     if (bot && IsAllowedOutfitCommandSuffix(suffix))
-        ok = ApplyBridgeNativeOutfitCommand(bot, suffix);
+        ok = ApplyBridgeNativeOutfitCommand(bot, suffix, persist);
 
     std::ostringstream payload;
     payload << UrlEncodeField(effectiveBotName)
