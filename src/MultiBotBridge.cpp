@@ -68,6 +68,8 @@ std::size_t constexpr kMaxStrategyNameLength = 96;
 std::size_t constexpr kMaxStrategyMatchedBots = 128;
 std::size_t constexpr kStrategyMutationRateLimit = 24;
 std::chrono::milliseconds constexpr kStrategyMutationRateWindow(2000);
+std::size_t constexpr kItemActionRateLimit = 24;
+std::chrono::milliseconds constexpr kItemActionRateWindow(2000);
 char const* const kStateFramingCapability = "STATE_FRAMING_V1";
 char const* const kStrategyMutationCapability = "STRATEGY_MUTATION_V1";
 char const* const kOutfitCapability = "OUTFIT_V1";
@@ -2138,11 +2140,7 @@ Creature* FindNearbyVendorSellingItem(Player* bot, uint32 itemId, uint32& vendor
     GuidVector const npcs = *context->GetValue<GuidVector>("nearest npcs");
     for (ObjectGuid const guid : npcs)
     {
-        Unit* const unit = botAI->GetUnit(guid);
-        if (!unit || unit->IsHostileTo(bot) || !unit->HasNpcFlag(static_cast<NPCFlags>(UNIT_NPC_FLAG_VENDOR)))
-            continue;
-
-        Creature* const creature = unit->ToCreature();
+        Creature* const creature = bot->GetNPCIfCanInteractWith(guid, UNIT_NPC_FLAG_VENDOR);
         if (!creature)
             continue;
 
@@ -2261,16 +2259,16 @@ void AddItemEntryToSnapshot(std::map<uint32, uint32>& itemCounts, std::map<uint3
     itemTemplates[itemId] = proto;
 }
 
-int32 GetGuildBankTabWithdrawRemaining(Guild* guild, Player* bot, uint8 tabId)
+int32 GetGuildBankTabWithdrawRemaining(Guild* guild, Player* player, uint8 tabId)
 {
-    if (!guild || !bot)
+    if (!guild || !player)
         return 0;
 
-    Guild::Member const* const member = guild->GetMember(bot->GetGUID());
+    Guild::Member const* const member = guild->GetMember(player->GetGUID());
     if (!member)
         return 0;
 
-    if (member->IsRank(GR_GUILDMASTER) || guild->GetLeaderGUID() == bot->GetGUID())
+    if (member->IsRank(GR_GUILDMASTER) || guild->GetLeaderGUID() == player->GetGUID())
         return std::numeric_limits<int32>::max();
 
     QueryResult result = CharacterDatabase.Query(
@@ -2296,12 +2294,12 @@ int32 GetGuildBankTabWithdrawRemaining(Guild* guild, Player* bot, uint8 tabId)
     return remaining > 0 ? int32(std::min<int64>(remaining, std::numeric_limits<int32>::max())) : 0;
 }
 
-int32 GetGuildBankWithdrawRemaining(Guild* guild, Player* bot)
+int32 GetGuildBankWithdrawRemaining(Guild* guild, Player* player)
 {
     int32 bestRemaining = 0;
     for (uint8 tabId = 0; tabId < GUILD_BANK_MAX_TABS; ++tabId)
     {
-        int32 const remaining = GetGuildBankTabWithdrawRemaining(guild, bot, tabId);
+        int32 const remaining = GetGuildBankTabWithdrawRemaining(guild, player, tabId);
         if (remaining == std::numeric_limits<int32>::max())
             return remaining;
 
@@ -2310,6 +2308,50 @@ int32 GetGuildBankWithdrawRemaining(Guild* guild, Player* bot)
     }
 
     return bestRemaining;
+}
+
+int32 GetEffectiveGuildBankWithdrawRemaining(Guild* guild, Player* requester, Player* bot)
+{
+    if (!guild || !requester || !bot)
+        return 0;
+
+    int32 bestRemaining = 0;
+    for (uint8 tabId = 0; tabId < GUILD_BANK_MAX_TABS; ++tabId)
+    {
+        int32 const requesterRemaining = GetGuildBankTabWithdrawRemaining(guild, requester, tabId);
+        int32 const botRemaining = GetGuildBankTabWithdrawRemaining(guild, bot, tabId);
+        int32 const effectiveRemaining = std::min(requesterRemaining, botRemaining);
+
+        if (effectiveRemaining == std::numeric_limits<int32>::max())
+            return effectiveRemaining;
+
+        if (effectiveRemaining > bestRemaining)
+            bestRemaining = effectiveRemaining;
+    }
+
+    return bestRemaining;
+}
+
+bool ConsumeGuildBankWithdrawSlot(Guild* guild, Player* player, uint8 tabId)
+{
+    if (!guild || !player)
+        return false;
+
+    int32 const remaining = GetGuildBankTabWithdrawRemaining(guild, player, tabId);
+    if (remaining == std::numeric_limits<int32>::max())
+        return true;
+
+    if (remaining <= 0)
+        return false;
+
+    Guild::Member* const member = guild->GetMember(player->GetGUID());
+    if (!member)
+        return false;
+
+    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+    member->UpdateBankWithdrawValue(trans, tabId, 1);
+    CharacterDatabase.CommitTransaction(trans);
+    return true;
 }
 
 void SendBankPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
@@ -2395,6 +2437,12 @@ void SendGuildBankPackets(Player* requester, ChatMsg replyType, std::string cons
         return;
     }
 
+    if (requester->GetGuildId() != bot->GetGuildId())
+    {
+        sendErrorAndEnd("NOT_IN_SAME_GUILD");
+        return;
+    }
+
     Guild* const guild = sGuildMgr->GetGuildById(bot->GetGuildId());
     if (!guild)
     {
@@ -2402,7 +2450,7 @@ void SendGuildBankPackets(Player* requester, ChatMsg replyType, std::string cons
         return;
     }
 
-    int32 const withdrawRemaining = GetGuildBankWithdrawRemaining(guild, bot);
+    int32 const withdrawRemaining = GetEffectiveGuildBankWithdrawRemaining(guild, requester, bot);
     SendAddonPacket(
         requester,
         replyType,
@@ -2417,6 +2465,10 @@ void SendGuildBankPackets(Player* requester, ChatMsg replyType, std::string cons
 
     for (uint8 tabId = 0; tabId < GUILD_BANK_MAX_TABS; ++tabId)
     {
+        if (!guild->MemberHasTabRights(requester->GetGUID(), tabId, GUILD_BANK_RIGHT_VIEW_TAB)
+            || !guild->MemberHasTabRights(bot->GetGUID(), tabId, GUILD_BANK_RIGHT_VIEW_TAB))
+            continue;
+
         QueryResult result = CharacterDatabase.Query(
             "SELECT ii.itemEntry, ii.count "
             "FROM guild_bank_item gbi "
@@ -3383,7 +3435,7 @@ uint32 MoveMatchingBankItemsToBags(Player* bot, uint32 itemId, uint32 requestedC
 
 uint32 MoveMatchingBagItemsToGuildBank(Player* requester, Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
 {
-    if (!bot || !itemId)
+    if (!requester || !bot || !itemId)
     {
         reason = "BAD_REQUEST";
         return 0;
@@ -3392,6 +3444,12 @@ uint32 MoveMatchingBagItemsToGuildBank(Player* requester, Player* bot, uint32 it
     if (!bot->GetGuildId())
     {
         reason = "BOT_NOT_IN_GUILD";
+        return 0;
+    }
+
+    if (requester->GetGuildId() != bot->GetGuildId())
+    {
+        reason = "NOT_IN_SAME_GUILD";
         return 0;
     }
 
@@ -3408,7 +3466,8 @@ uint32 MoveMatchingBagItemsToGuildBank(Player* requester, Player* bot, uint32 it
         return 0;
     }
 
-    if (!guild->MemberHasTabRights(bot->GetGUID(), 0, GUILD_BANK_RIGHT_DEPOSIT_ITEM))
+    if (!guild->MemberHasTabRights(requester->GetGUID(), 0, GUILD_BANK_RIGHT_DEPOSIT_ITEM)
+        || !guild->MemberHasTabRights(bot->GetGUID(), 0, GUILD_BANK_RIGHT_DEPOSIT_ITEM))
     {
         reason = "NO_GUILD_BANK_RIGHTS";
         return 0;
@@ -3442,9 +3501,9 @@ uint32 MoveMatchingBagItemsToGuildBank(Player* requester, Player* bot, uint32 it
     return moved;
 }
 
-uint32 MoveMatchingGuildBankItemsToBags(Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
+uint32 MoveMatchingGuildBankItemsToBags(Player* requester, Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
 {
-    if (!bot || !itemId)
+    if (!requester || !bot || !itemId)
     {
         reason = "BAD_REQUEST";
         return 0;
@@ -3453,6 +3512,12 @@ uint32 MoveMatchingGuildBankItemsToBags(Player* bot, uint32 itemId, uint32 reque
     if (!bot->GetGuildId())
     {
         reason = "BOT_NOT_IN_GUILD";
+        return 0;
+    }
+
+    if (requester->GetGuildId() != bot->GetGuildId())
+    {
+        reason = "NOT_IN_SAME_GUILD";
         return 0;
     }
 
@@ -3469,7 +3534,7 @@ uint32 MoveMatchingGuildBankItemsToBags(Player* bot, uint32 itemId, uint32 reque
         return 0;
     }
 
-    if (GetGuildBankWithdrawRemaining(guild, bot) == 0)
+    if (GetEffectiveGuildBankWithdrawRemaining(guild, requester, bot) == 0)
     {
         reason = "NO_GUILD_BANK_RIGHTS";
         return 0;
@@ -3501,7 +3566,8 @@ uint32 MoveMatchingGuildBankItemsToBags(Player* bot, uint32 itemId, uint32 reque
         uint32 const stackCount = fields[2].Get<uint32>();
         foundAny = true;
 
-        if (GetGuildBankTabWithdrawRemaining(guild, bot, tabId) == 0)
+        if (GetGuildBankTabWithdrawRemaining(guild, requester, tabId) == 0
+            || GetGuildBankTabWithdrawRemaining(guild, bot, tabId) == 0)
             continue;
 
         foundWithdrawable = true;
@@ -3523,7 +3589,11 @@ uint32 MoveMatchingGuildBankItemsToBags(Player* bot, uint32 itemId, uint32 reque
         uint32 const after = bot->GetItemCount(itemId, false);
 
         if (after > before)
+        {
             moved += after - before;
+            if (requester->GetGUID() != bot->GetGUID())
+                ConsumeGuildBankWithdrawSlot(guild, requester, tabId);
+        }
 
         if (requestedCount > 0 && moved >= requestedCount)
             break;
@@ -3594,6 +3664,47 @@ uint32 BuyMatchingVendorItem(Player* bot, uint32 itemId, uint32 requestedCount, 
     return bought;
 }
 
+struct ItemActionRateState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+};
+
+std::map<std::string, ItemActionRateState> sItemActionRateStates;
+
+bool ConsumeItemActionRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+    ItemActionRateState& state = sItemActionRateStates[key];
+
+    while (!state.requests.empty() && now - state.requests.front() >= kItemActionRateWindow)
+        state.requests.pop_front();
+
+    if (state.requests.size() >= kItemActionRateLimit)
+        return false;
+
+    state.requests.push_back(now);
+
+    if (sItemActionRateStates.size() > 512)
+    {
+        for (auto it = sItemActionRateStates.begin(); it != sItemActionRateStates.end();)
+        {
+            while (!it->second.requests.empty() && now - it->second.requests.front() >= kItemActionRateWindow)
+                it->second.requests.pop_front();
+
+            if (it->second.requests.empty() && it->first != key)
+                it = sItemActionRateStates.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    return true;
+}
+
 void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue)
 {
     std::string const trimmedBotName = Trim(botName);
@@ -3609,20 +3720,35 @@ void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::st
 
     std::string reason;
     uint32 moved = 0;
-    if (!bot)
+    if (!ConsumeItemActionRateLimit(requester))
+    {
+        reason = "RATE_LIMIT";
+    }
+    else if (!bot)
+    {
         reason = "NO_BOT";
-    else if (action == "BANK_DEPOSIT")
-        moved = MoveMatchingBagItemsToBank(bot, itemId, requestedCount, reason);
-    else if (action == "BANK_WITHDRAW")
-        moved = MoveMatchingBankItemsToBags(bot, itemId, requestedCount, reason);
-    else if (action == "GBANK_DEPOSIT")
-        moved = MoveMatchingBagItemsToGuildBank(requester, bot, itemId, requestedCount, reason);
-    else if (action == "GBANK_WITHDRAW")
-        moved = MoveMatchingGuildBankItemsToBags(bot, itemId, requestedCount, reason);
-    else if (action == "BUY_ITEM")
-        moved = BuyMatchingVendorItem(bot, itemId, requestedCount, reason);
+    }
     else
-        reason = "BAD_ACTION";
+    {
+        PlayerbotAI* const botAI = GetBotAI(bot);
+        if (!botAI || !botAI->GetSecurity() ||
+            !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+        {
+            reason = "FORBIDDEN";
+        }
+        else if (action == "BANK_DEPOSIT")
+            moved = MoveMatchingBagItemsToBank(bot, itemId, requestedCount, reason);
+        else if (action == "BANK_WITHDRAW")
+            moved = MoveMatchingBankItemsToBags(bot, itemId, requestedCount, reason);
+        else if (action == "GBANK_DEPOSIT")
+            moved = MoveMatchingBagItemsToGuildBank(requester, bot, itemId, requestedCount, reason);
+        else if (action == "GBANK_WITHDRAW")
+            moved = MoveMatchingGuildBankItemsToBags(requester, bot, itemId, requestedCount, reason);
+        else if (action == "BUY_ITEM")
+            moved = BuyMatchingVendorItem(bot, itemId, requestedCount, reason);
+        else
+            reason = "BAD_ACTION";
+    }
 
     bool const ok = moved > 0;
     if (ok)
