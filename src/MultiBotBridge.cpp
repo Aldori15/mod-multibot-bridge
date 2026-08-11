@@ -2259,16 +2259,16 @@ void AddItemEntryToSnapshot(std::map<uint32, uint32>& itemCounts, std::map<uint3
     itemTemplates[itemId] = proto;
 }
 
-int32 GetGuildBankTabWithdrawRemaining(Guild* guild, Player* bot, uint8 tabId)
+int32 GetGuildBankTabWithdrawRemaining(Guild* guild, Player* player, uint8 tabId)
 {
-    if (!guild || !bot)
+    if (!guild || !player)
         return 0;
 
-    Guild::Member const* const member = guild->GetMember(bot->GetGUID());
+    Guild::Member const* const member = guild->GetMember(player->GetGUID());
     if (!member)
         return 0;
 
-    if (member->IsRank(GR_GUILDMASTER) || guild->GetLeaderGUID() == bot->GetGUID())
+    if (member->IsRank(GR_GUILDMASTER) || guild->GetLeaderGUID() == player->GetGUID())
         return std::numeric_limits<int32>::max();
 
     QueryResult result = CharacterDatabase.Query(
@@ -2294,12 +2294,12 @@ int32 GetGuildBankTabWithdrawRemaining(Guild* guild, Player* bot, uint8 tabId)
     return remaining > 0 ? int32(std::min<int64>(remaining, std::numeric_limits<int32>::max())) : 0;
 }
 
-int32 GetGuildBankWithdrawRemaining(Guild* guild, Player* bot)
+int32 GetGuildBankWithdrawRemaining(Guild* guild, Player* player)
 {
     int32 bestRemaining = 0;
     for (uint8 tabId = 0; tabId < GUILD_BANK_MAX_TABS; ++tabId)
     {
-        int32 const remaining = GetGuildBankTabWithdrawRemaining(guild, bot, tabId);
+        int32 const remaining = GetGuildBankTabWithdrawRemaining(guild, player, tabId);
         if (remaining == std::numeric_limits<int32>::max())
             return remaining;
 
@@ -2308,6 +2308,50 @@ int32 GetGuildBankWithdrawRemaining(Guild* guild, Player* bot)
     }
 
     return bestRemaining;
+}
+
+int32 GetEffectiveGuildBankWithdrawRemaining(Guild* guild, Player* requester, Player* bot)
+{
+    if (!guild || !requester || !bot)
+        return 0;
+
+    int32 bestRemaining = 0;
+    for (uint8 tabId = 0; tabId < GUILD_BANK_MAX_TABS; ++tabId)
+    {
+        int32 const requesterRemaining = GetGuildBankTabWithdrawRemaining(guild, requester, tabId);
+        int32 const botRemaining = GetGuildBankTabWithdrawRemaining(guild, bot, tabId);
+        int32 const effectiveRemaining = std::min(requesterRemaining, botRemaining);
+
+        if (effectiveRemaining == std::numeric_limits<int32>::max())
+            return effectiveRemaining;
+
+        if (effectiveRemaining > bestRemaining)
+            bestRemaining = effectiveRemaining;
+    }
+
+    return bestRemaining;
+}
+
+bool ConsumeGuildBankWithdrawSlot(Guild* guild, Player* player, uint8 tabId)
+{
+    if (!guild || !player)
+        return false;
+
+    int32 const remaining = GetGuildBankTabWithdrawRemaining(guild, player, tabId);
+    if (remaining == std::numeric_limits<int32>::max())
+        return true;
+
+    if (remaining <= 0)
+        return false;
+
+    Guild::Member* const member = guild->GetMember(player->GetGUID());
+    if (!member)
+        return false;
+
+    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+    member->UpdateBankWithdrawValue(trans, tabId, 1);
+    CharacterDatabase.CommitTransaction(trans);
+    return true;
 }
 
 void SendBankPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
@@ -2393,6 +2437,12 @@ void SendGuildBankPackets(Player* requester, ChatMsg replyType, std::string cons
         return;
     }
 
+    if (requester->GetGuildId() != bot->GetGuildId())
+    {
+        sendErrorAndEnd("NOT_IN_SAME_GUILD");
+        return;
+    }
+
     Guild* const guild = sGuildMgr->GetGuildById(bot->GetGuildId());
     if (!guild)
     {
@@ -2400,7 +2450,7 @@ void SendGuildBankPackets(Player* requester, ChatMsg replyType, std::string cons
         return;
     }
 
-    int32 const withdrawRemaining = GetGuildBankWithdrawRemaining(guild, bot);
+    int32 const withdrawRemaining = GetEffectiveGuildBankWithdrawRemaining(guild, requester, bot);
     SendAddonPacket(
         requester,
         replyType,
@@ -2415,6 +2465,10 @@ void SendGuildBankPackets(Player* requester, ChatMsg replyType, std::string cons
 
     for (uint8 tabId = 0; tabId < GUILD_BANK_MAX_TABS; ++tabId)
     {
+        if (!guild->MemberHasTabRights(requester->GetGUID(), tabId, GUILD_BANK_RIGHT_VIEW_TAB)
+            || !guild->MemberHasTabRights(bot->GetGUID(), tabId, GUILD_BANK_RIGHT_VIEW_TAB))
+            continue;
+
         QueryResult result = CharacterDatabase.Query(
             "SELECT ii.itemEntry, ii.count "
             "FROM guild_bank_item gbi "
@@ -3412,7 +3466,8 @@ uint32 MoveMatchingBagItemsToGuildBank(Player* requester, Player* bot, uint32 it
         return 0;
     }
 
-    if (!guild->MemberHasTabRights(bot->GetGUID(), 0, GUILD_BANK_RIGHT_DEPOSIT_ITEM))
+    if (!guild->MemberHasTabRights(requester->GetGUID(), 0, GUILD_BANK_RIGHT_DEPOSIT_ITEM)
+        || !guild->MemberHasTabRights(bot->GetGUID(), 0, GUILD_BANK_RIGHT_DEPOSIT_ITEM))
     {
         reason = "NO_GUILD_BANK_RIGHTS";
         return 0;
@@ -3479,7 +3534,7 @@ uint32 MoveMatchingGuildBankItemsToBags(Player* requester, Player* bot, uint32 i
         return 0;
     }
 
-    if (GetGuildBankWithdrawRemaining(guild, bot) == 0)
+    if (GetEffectiveGuildBankWithdrawRemaining(guild, requester, bot) == 0)
     {
         reason = "NO_GUILD_BANK_RIGHTS";
         return 0;
@@ -3511,7 +3566,8 @@ uint32 MoveMatchingGuildBankItemsToBags(Player* requester, Player* bot, uint32 i
         uint32 const stackCount = fields[2].Get<uint32>();
         foundAny = true;
 
-        if (GetGuildBankTabWithdrawRemaining(guild, bot, tabId) == 0)
+        if (GetGuildBankTabWithdrawRemaining(guild, requester, tabId) == 0
+            || GetGuildBankTabWithdrawRemaining(guild, bot, tabId) == 0)
             continue;
 
         foundWithdrawable = true;
@@ -3533,7 +3589,11 @@ uint32 MoveMatchingGuildBankItemsToBags(Player* requester, Player* bot, uint32 i
         uint32 const after = bot->GetItemCount(itemId, false);
 
         if (after > before)
+        {
             moved += after - before;
+            if (requester->GetGUID() != bot->GetGUID())
+                ConsumeGuildBankWithdrawSlot(guild, requester, tabId);
+        }
 
         if (requestedCount > 0 && moved >= requestedCount)
             break;
