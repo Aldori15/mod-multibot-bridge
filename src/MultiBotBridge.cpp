@@ -68,6 +68,8 @@ std::size_t constexpr kMaxStrategyNameLength = 96;
 std::size_t constexpr kMaxStrategyMatchedBots = 128;
 std::size_t constexpr kStrategyMutationRateLimit = 24;
 std::chrono::milliseconds constexpr kStrategyMutationRateWindow(2000);
+std::size_t constexpr kItemActionRateLimit = 24;
+std::chrono::milliseconds constexpr kItemActionRateWindow(2000);
 char const* const kStateFramingCapability = "STATE_FRAMING_V1";
 char const* const kStrategyMutationCapability = "STRATEGY_MUTATION_V1";
 char const* const kOutfitCapability = "OUTFIT_V1";
@@ -2138,11 +2140,7 @@ Creature* FindNearbyVendorSellingItem(Player* bot, uint32 itemId, uint32& vendor
     GuidVector const npcs = *context->GetValue<GuidVector>("nearest npcs");
     for (ObjectGuid const guid : npcs)
     {
-        Unit* const unit = botAI->GetUnit(guid);
-        if (!unit || unit->IsHostileTo(bot) || !unit->HasNpcFlag(static_cast<NPCFlags>(UNIT_NPC_FLAG_VENDOR)))
-            continue;
-
-        Creature* const creature = unit->ToCreature();
+        Creature* const creature = bot->GetNPCIfCanInteractWith(guid, UNIT_NPC_FLAG_VENDOR);
         if (!creature)
             continue;
 
@@ -3383,7 +3381,7 @@ uint32 MoveMatchingBankItemsToBags(Player* bot, uint32 itemId, uint32 requestedC
 
 uint32 MoveMatchingBagItemsToGuildBank(Player* requester, Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
 {
-    if (!bot || !itemId)
+    if (!requester || !bot || !itemId)
     {
         reason = "BAD_REQUEST";
         return 0;
@@ -3392,6 +3390,12 @@ uint32 MoveMatchingBagItemsToGuildBank(Player* requester, Player* bot, uint32 it
     if (!bot->GetGuildId())
     {
         reason = "BOT_NOT_IN_GUILD";
+        return 0;
+    }
+
+    if (requester->GetGuildId() != bot->GetGuildId())
+    {
+        reason = "NOT_IN_SAME_GUILD";
         return 0;
     }
 
@@ -3442,9 +3446,9 @@ uint32 MoveMatchingBagItemsToGuildBank(Player* requester, Player* bot, uint32 it
     return moved;
 }
 
-uint32 MoveMatchingGuildBankItemsToBags(Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
+uint32 MoveMatchingGuildBankItemsToBags(Player* requester, Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
 {
-    if (!bot || !itemId)
+    if (!requester || !bot || !itemId)
     {
         reason = "BAD_REQUEST";
         return 0;
@@ -3453,6 +3457,12 @@ uint32 MoveMatchingGuildBankItemsToBags(Player* bot, uint32 itemId, uint32 reque
     if (!bot->GetGuildId())
     {
         reason = "BOT_NOT_IN_GUILD";
+        return 0;
+    }
+
+    if (requester->GetGuildId() != bot->GetGuildId())
+    {
+        reason = "NOT_IN_SAME_GUILD";
         return 0;
     }
 
@@ -3594,6 +3604,47 @@ uint32 BuyMatchingVendorItem(Player* bot, uint32 itemId, uint32 requestedCount, 
     return bought;
 }
 
+struct ItemActionRateState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+};
+
+std::map<std::string, ItemActionRateState> sItemActionRateStates;
+
+bool ConsumeItemActionRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+    ItemActionRateState& state = sItemActionRateStates[key];
+
+    while (!state.requests.empty() && now - state.requests.front() >= kItemActionRateWindow)
+        state.requests.pop_front();
+
+    if (state.requests.size() >= kItemActionRateLimit)
+        return false;
+
+    state.requests.push_back(now);
+
+    if (sItemActionRateStates.size() > 512)
+    {
+        for (auto it = sItemActionRateStates.begin(); it != sItemActionRateStates.end();)
+        {
+            while (!it->second.requests.empty() && now - it->second.requests.front() >= kItemActionRateWindow)
+                it->second.requests.pop_front();
+
+            if (it->second.requests.empty() && it->first != key)
+                it = sItemActionRateStates.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    return true;
+}
+
 void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue)
 {
     std::string const trimmedBotName = Trim(botName);
@@ -3609,20 +3660,35 @@ void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::st
 
     std::string reason;
     uint32 moved = 0;
-    if (!bot)
+    if (!ConsumeItemActionRateLimit(requester))
+    {
+        reason = "RATE_LIMIT";
+    }
+    else if (!bot)
+    {
         reason = "NO_BOT";
-    else if (action == "BANK_DEPOSIT")
-        moved = MoveMatchingBagItemsToBank(bot, itemId, requestedCount, reason);
-    else if (action == "BANK_WITHDRAW")
-        moved = MoveMatchingBankItemsToBags(bot, itemId, requestedCount, reason);
-    else if (action == "GBANK_DEPOSIT")
-        moved = MoveMatchingBagItemsToGuildBank(requester, bot, itemId, requestedCount, reason);
-    else if (action == "GBANK_WITHDRAW")
-        moved = MoveMatchingGuildBankItemsToBags(bot, itemId, requestedCount, reason);
-    else if (action == "BUY_ITEM")
-        moved = BuyMatchingVendorItem(bot, itemId, requestedCount, reason);
+    }
     else
-        reason = "BAD_ACTION";
+    {
+        PlayerbotAI* const botAI = GetBotAI(bot);
+        if (!botAI || !botAI->GetSecurity() ||
+            !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+        {
+            reason = "FORBIDDEN";
+        }
+        else if (action == "BANK_DEPOSIT")
+            moved = MoveMatchingBagItemsToBank(bot, itemId, requestedCount, reason);
+        else if (action == "BANK_WITHDRAW")
+            moved = MoveMatchingBankItemsToBags(bot, itemId, requestedCount, reason);
+        else if (action == "GBANK_DEPOSIT")
+            moved = MoveMatchingBagItemsToGuildBank(requester, bot, itemId, requestedCount, reason);
+        else if (action == "GBANK_WITHDRAW")
+            moved = MoveMatchingGuildBankItemsToBags(requester, bot, itemId, requestedCount, reason);
+        else if (action == "BUY_ITEM")
+            moved = BuyMatchingVendorItem(bot, itemId, requestedCount, reason);
+        else
+            reason = "BAD_ACTION";
+    }
 
     bool const ok = moved > 0;
     if (ok)
