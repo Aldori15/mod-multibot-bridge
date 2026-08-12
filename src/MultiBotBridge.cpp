@@ -3766,21 +3766,39 @@ void AddBridgeCraftOutputsFromSpellInfo(SpellInfo const* spellInfo, std::set<uin
     }
 }
 
-void AddBridgeCraftOutputsFromSpell(uint32 spellId, std::set<uint32>& itemIds)
+void AddBridgeCraftOutputsFromSpell(uint32 spellId, std::set<uint32>& itemIds,
+                                    std::set<uint32>* visitedSpellIds = nullptr)
 {
-    SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(spellId);
-    if (!spellInfo)
-        return;
+    std::set<uint32> visitedSpells;
+    std::vector<uint32> pendingSpells;
+    pendingSpells.push_back(spellId);
 
-    AddBridgeCraftOutputsFromSpellInfo(spellInfo, itemIds);
-
-    // One triggered-spell level, matching the audited Playerbots pattern.
-    // Only created outputs are recorded; reagents are never treated as crafts.
-    for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+    while (!pendingSpells.empty())
     {
-        uint32 const triggerSpell = spellInfo->Effects[i].TriggerSpell;
-        if (triggerSpell)
-            AddBridgeCraftOutputsFromSpellInfo(sSpellMgr->GetSpellInfo(triggerSpell), itemIds);
+        uint32 const currentSpellId = pendingSpells.back();
+        pendingSpells.pop_back();
+
+        if (!currentSpellId || !visitedSpells.insert(currentSpellId).second)
+            continue;
+
+        SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(currentSpellId);
+        if (!spellInfo)
+            continue;
+
+        if (visitedSpellIds)
+            visitedSpellIds->insert(currentSpellId);
+
+        AddBridgeCraftOutputsFromSpellInfo(spellInfo, itemIds);
+
+        // Follow the complete TriggerSpell graph. The visited set prevents
+        // cycles while preserving every concrete create-item output reachable
+        // from a profession or recipe spell.
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+        {
+            uint32 const triggerSpell = spellInfo->Effects[i].TriggerSpell;
+            if (triggerSpell && visitedSpells.find(triggerSpell) == visitedSpells.end())
+                pendingSpells.push_back(triggerSpell);
+        }
     }
 }
 
@@ -3852,6 +3870,29 @@ BridgeReferenceLootRows BuildBridgeReferenceLootRows()
     return rows;
 }
 
+BridgeReferenceLootRows BuildBridgeLootTableRows(char const* tableName)
+{
+    BridgeReferenceLootRows rows;
+
+    QueryResult result = WorldDatabase.Query(
+        "SELECT Entry, Item, Reference FROM {}", tableName);
+    if (!result)
+        return rows;
+
+    do
+    {
+        Field* const fields = result->Fetch();
+        uint32 const entryId = fields[0].Get<uint32>();
+        uint32 const itemId = fields[1].Get<uint32>();
+        uint32 const referenceId = fields[2].Get<uint32>();
+
+        if (entryId)
+            rows[entryId].push_back({itemId, referenceId});
+    } while (result->NextRow());
+
+    return rows;
+}
+
 void AddBridgeReferenceLootOutputs(std::set<uint32> const& initialReferences,
                                    BridgeReferenceLootRows const& referenceRows,
                                    std::set<uint32>& itemIds)
@@ -3882,6 +3923,40 @@ void AddBridgeReferenceLootOutputs(std::set<uint32> const& initialReferences,
     }
 }
 
+void AddBridgeLootEntryOutputs(uint32 entryId,
+                               BridgeReferenceLootRows const& lootRows,
+                               BridgeReferenceLootRows const& referenceRows,
+                               std::set<uint32>& itemIds)
+{
+    auto const rowsIt = lootRows.find(entryId);
+    if (!entryId || rowsIt == lootRows.end())
+        return;
+
+    std::set<uint32> references;
+    for (auto const& row : rowsIt->second)
+    {
+        if (row.first)
+            itemIds.insert(row.first);
+
+        if (row.second)
+            references.insert(row.second);
+    }
+
+    AddBridgeReferenceLootOutputs(references, referenceRows, itemIds);
+}
+
+void AddBridgeCraftAndSpellLootOutputs(uint32 spellId,
+                                       BridgeReferenceLootRows const& spellLootRows,
+                                       BridgeReferenceLootRows const& referenceRows,
+                                       std::set<uint32>& itemIds)
+{
+    std::set<uint32> visitedSpellIds;
+    AddBridgeCraftOutputsFromSpell(spellId, itemIds, &visitedSpellIds);
+
+    for (uint32 const visitedSpellId : visitedSpellIds)
+        AddBridgeLootEntryOutputs(visitedSpellId, spellLootRows, referenceRows, itemIds);
+}
+
 void AddBridgeLootTableOutputs(char const* tableName,
                                BridgeReferenceLootRows const& referenceRows,
                                std::set<uint32>& itemIds)
@@ -3910,10 +3985,14 @@ std::map<uint32, std::set<uint32>> const& GetBridgeCraftOutputsBySkill()
 {
     // The source data is process-wide and immutable for normal runtime use.
     // Function-local static initialization is thread-safe, so the expensive
-    // SkillLineAbility and item-template scans run only on the first request.
+    // SkillLineAbility, item-template, and loot-table scans run only once.
     static std::map<uint32, std::set<uint32>> const outputsBySkill = []()
     {
         std::map<uint32, std::set<uint32>> outputs;
+
+        BridgeReferenceLootRows const referenceLootRows = BuildBridgeReferenceLootRows();
+        BridgeReferenceLootRows const spellLootRows =
+            BuildBridgeLootTableRows("spell_loot_template");
 
         for (SkillType const skill : GetBridgeCraftProtectionSkills())
         {
@@ -3923,13 +4002,15 @@ std::map<uint32, std::set<uint32>> const& GetBridgeCraftOutputsBySkill()
             for (SkillLineAbilityEntry const* const ability : GetSkillLineAbilitiesBySkillLine(skillId))
             {
                 if (ability)
-                    AddBridgeCraftOutputsFromSpell(ability->Spell, skillOutputs);
+                    AddBridgeCraftAndSpellLootOutputs(
+                        ability->Spell, spellLootRows, referenceLootRows, skillOutputs);
             }
         }
 
         // Conservative recipe fallback audited from Playerbots. Scan the item
         // template store once, then attach each recognized recipe output to the
-        // corresponding profession set.
+        // corresponding profession set. Random spell-loot outputs and every
+        // reachable TriggerSpell are covered by the same helper.
         std::vector<ItemTemplate*> const* const itemTemplates = sObjectMgr->GetItemTemplateStoreFast();
         if (itemTemplates)
         {
@@ -3944,16 +4025,15 @@ std::map<uint32, std::set<uint32>> const& GetBridgeCraftOutputsBySkill()
                 {
                     uint32 const spellId = recipe->Spells[i].SpellId;
                     if (spellId)
-                        AddBridgeCraftOutputsFromSpell(spellId, outputIt->second);
+                        AddBridgeCraftAndSpellLootOutputs(
+                            spellId, spellLootRows, referenceLootRows, outputIt->second);
                 }
             }
         }
 
-        // Prospecting, milling, and disenchanting use loot templates instead of
-        // SPELL_EFFECT_CREATE_ITEM(_2). Include every possible output,
-        // following reference_loot_template recursively, in the same
-        // process-wide cache used by SELL_VENDOR.
-        BridgeReferenceLootRows const referenceLootRows = BuildBridgeReferenceLootRows();
+        // Prospecting, milling, and disenchanting use dedicated loot templates.
+        // Include every possible output and follow reference_loot_template
+        // recursively in the same process-wide cache used by SELL_VENDOR.
         AddBridgeLootTableOutputs(
             "prospecting_loot_template", referenceLootRows,
             outputs[static_cast<uint32>(SKILL_JEWELCRAFTING)]);
