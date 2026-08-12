@@ -75,6 +75,7 @@ char const* const kStateFramingCapability = "STATE_FRAMING_V1";
 char const* const kStrategyMutationCapability = "STRATEGY_MUTATION_V1";
 char const* const kOutfitCapability = "OUTFIT_V1";
 char const* const kInventoryCapability = "INVENTORY_V1";
+char const* const kInventoryBulkSellCapability = "INVENTORY_BULK_SELL_V1";
 uint32 constexpr kMaxItemActionCount = 1000;
 
 enum class BridgePayloadStatus
@@ -3826,6 +3827,85 @@ std::array<SkillType, 14> const& GetBridgeCraftProtectionSkills()
     return skills;
 }
 
+using BridgeReferenceLootRows = std::map<uint32, std::vector<std::pair<uint32, uint32>>>;
+
+BridgeReferenceLootRows BuildBridgeReferenceLootRows()
+{
+    BridgeReferenceLootRows rows;
+
+    QueryResult result = WorldDatabase.Query(
+        "SELECT Entry, Item, Reference FROM reference_loot_template");
+    if (!result)
+        return rows;
+
+    do
+    {
+        Field* const fields = result->Fetch();
+        uint32 const entryId = fields[0].Get<uint32>();
+        uint32 const itemId = fields[1].Get<uint32>();
+        uint32 const referenceId = fields[2].Get<uint32>();
+
+        if (entryId)
+            rows[entryId].push_back({itemId, referenceId});
+    } while (result->NextRow());
+
+    return rows;
+}
+
+void AddBridgeReferenceLootOutputs(std::set<uint32> const& initialReferences,
+                                   BridgeReferenceLootRows const& referenceRows,
+                                   std::set<uint32>& itemIds)
+{
+    std::set<uint32> visitedReferences;
+    std::vector<uint32> pendingReferences(initialReferences.begin(), initialReferences.end());
+
+    while (!pendingReferences.empty())
+    {
+        uint32 const referenceId = pendingReferences.back();
+        pendingReferences.pop_back();
+
+        if (!referenceId || !visitedReferences.insert(referenceId).second)
+            continue;
+
+        auto const rowsIt = referenceRows.find(referenceId);
+        if (rowsIt == referenceRows.end())
+            continue;
+
+        for (auto const& row : rowsIt->second)
+        {
+            if (row.first)
+                itemIds.insert(row.first);
+
+            if (row.second && visitedReferences.find(row.second) == visitedReferences.end())
+                pendingReferences.push_back(row.second);
+        }
+    }
+}
+
+void AddBridgeLootTableOutputs(char const* tableName,
+                               BridgeReferenceLootRows const& referenceRows,
+                               std::set<uint32>& itemIds)
+{
+    QueryResult result = WorldDatabase.Query("SELECT Item, Reference FROM {}", tableName);
+    if (!result)
+        return;
+
+    std::set<uint32> references;
+    do
+    {
+        Field* const fields = result->Fetch();
+        uint32 const itemId = fields[0].Get<uint32>();
+        uint32 const referenceId = fields[1].Get<uint32>();
+
+        if (itemId)
+            itemIds.insert(itemId);
+
+        if (referenceId)
+            references.insert(referenceId);
+    } while (result->NextRow());
+
+    AddBridgeReferenceLootOutputs(references, referenceRows, itemIds);
+}
 std::map<uint32, std::set<uint32>> const& GetBridgeCraftOutputsBySkill()
 {
     // The source data is process-wide and immutable for normal runtime use.
@@ -3868,6 +3948,18 @@ std::map<uint32, std::set<uint32>> const& GetBridgeCraftOutputsBySkill()
                 }
             }
         }
+
+        // Prospecting and milling use loot templates instead of
+        // SPELL_EFFECT_CREATE_ITEM(_2). Include every possible output,
+        // following reference_loot_template recursively, in the same
+        // process-wide cache used by SELL_VENDOR.
+        BridgeReferenceLootRows const referenceLootRows = BuildBridgeReferenceLootRows();
+        AddBridgeLootTableOutputs(
+            "prospecting_loot_template", referenceLootRows,
+            outputs[static_cast<uint32>(SKILL_JEWELCRAFTING)]);
+        AddBridgeLootTableOutputs(
+            "milling_loot_template", referenceLootRows,
+            outputs[static_cast<uint32>(SKILL_INSCRIPTION)]);
 
         return outputs;
     }();
@@ -5980,7 +6072,7 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             player,
             replyType,
             "CAPS",
-            std::string(kStateFramingCapability) + "," + kStrategyMutationCapability + "," + kOutfitCapability + "," + kInventoryCapability);
+            std::string(kStateFramingCapability) + "," + kStrategyMutationCapability + "," + kOutfitCapability + "," + kInventoryCapability + "," + kInventoryBulkSellCapability);
         return true;
     }
 
