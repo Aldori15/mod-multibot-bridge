@@ -3949,7 +3949,7 @@ std::map<uint32, std::set<uint32>> const& GetBridgeCraftOutputsBySkill()
             }
         }
 
-        // Prospecting and milling use loot templates instead of
+        // Prospecting, milling, and disenchanting use loot templates instead of
         // SPELL_EFFECT_CREATE_ITEM(_2). Include every possible output,
         // following reference_loot_template recursively, in the same
         // process-wide cache used by SELL_VENDOR.
@@ -3960,6 +3960,9 @@ std::map<uint32, std::set<uint32>> const& GetBridgeCraftOutputsBySkill()
         AddBridgeLootTableOutputs(
             "milling_loot_template", referenceLootRows,
             outputs[static_cast<uint32>(SKILL_INSCRIPTION)]);
+        AddBridgeLootTableOutputs(
+            "disenchant_loot_template", referenceLootRows,
+            outputs[static_cast<uint32>(SKILL_ENCHANTING)]);
 
         return outputs;
     }();
@@ -4211,13 +4214,11 @@ void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::st
     std::string const action = ToUpper(Trim(actionValue));
     uint32 itemId = 0;
     uint32 requestedCount = 0;
+    bool sellParamsInvalid = false;
     if (action == "SELL_GREY" || action == "SELL_VENDOR")
     {
         if (Trim(itemIdValue) != "0" || Trim(countValue) != "0")
-        {
-            itemId = std::numeric_limits<uint32>::max();
-            requestedCount = std::numeric_limits<uint32>::max();
-        }
+            sellParamsInvalid = true;
     }
     else
     {
@@ -4258,14 +4259,14 @@ void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::st
             moved = BuyMatchingVendorItem(bot, itemId, requestedCount, reason);
         else if (action == "SELL_GREY")
         {
-            if (itemId != 0 || requestedCount != 0)
+            if (sellParamsInvalid)
                 reason = "BAD_REQUEST";
             else
                 moved = SellGreyBagItems(bot, reason);
         }
         else if (action == "SELL_VENDOR")
         {
-            if (itemId != 0 || requestedCount != 0)
+            if (sellParamsInvalid)
                 reason = "BAD_REQUEST";
             else
                 moved = SellVendorBagItems(bot, reason);
