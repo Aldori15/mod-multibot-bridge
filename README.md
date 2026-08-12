@@ -311,8 +311,12 @@ Server -> Addon:  MBOT PONG~<token>
 Addon  -> Server: MBOT GET~ROSTER
 Server -> Addon:  MBOT ROSTER~...
 
-Addon  -> Server: MBOT GET~STATES
-Server -> Addon:  MBOT STATES~...
+Addon  -> Server: MBOT GET~STATES~<token>
+Server -> Addon:  MBOT STATES_BEGIN~<token>~<botCount>
+Server -> Addon:  MBOT STATE_BEGIN~<token>~<botName>~<combatCount>~<nonCombatCount>
+Server -> Addon:  MBOT STATE_ITEM~<token>~<botName>~<scope>~<index>~<strategy>
+Server -> Addon:  MBOT STATE_END~<token>~<botName>~<combatCount>~<nonCombatCount>
+Server -> Addon:  MBOT STATES_END~<token>~<botCount>
 
 Addon  -> Server: MBOT RUN~FORMATION~GROUP~~<token>~<formation>
 Server -> Addon:  MBOT FORMATION_ACK~GROUP~~<token>~<success>~<failure>~<formation>
@@ -364,8 +368,29 @@ The `RAID` execution scope now requires the requester and the bot to be members
 of the same actual raid. It is no longer treated as the unrestricted `ALL`
 scope.
 
-Outgoing response framing and pagination remain a separate protocol task. This
-hardening change does not fragment existing server responses.
+## STATE response framing
+
+Current bridge and addon versions negotiate the `STATE_FRAMING_V1` capability.
+When that capability is present, state queries use tokenized requests:
+
+```text
+GET~STATE~<botName>~<token>
+GET~STATES~<token>
+```
+
+The bridge returns state data as bounded `STATE_BEGIN`, `STATE_ITEM`, `STATE_END`,
+`STATES_BEGIN`, and `STATES_END` frames. Before any state frame is queued or sent,
+the bridge checks the actual addon wire length, including the `MBOT\t` envelope,
+opcode and field separator, against the 255-byte client limit.
+
+The unframed `GET~STATE~<botName>` and `GET~STATES` forms remain available only as
+legacy compatibility paths for addons that do not negotiate `STATE_FRAMING_V1`.
+Those legacy forms still use monolithic `STATE` responses and may return
+`STATE_TOO_LONG` when a state cannot fit within the wire limit.
+
+This framing guarantee currently applies to the STATE protocol. Other response
+families continue to use their own bounded packet or pagination mechanisms and
+should not be assumed to be generically fragmented by this capability.
 
 ---
 
@@ -389,8 +414,8 @@ hardening change does not fragment existing server responses.
     <td>Refresh bot roster without legacy chat parsing.</td>
   </tr>
   <tr>
-    <td><code>GET~STATES</code></td>
-    <td>Refresh bot state flags and UI state data.</td>
+    <td><code>GET~STATE</code> / <code>GET~STATES</code></td>
+    <td>Refresh bot strategies and UI state data. Current clients negotiate <code>STATE_FRAMING_V1</code> and use tokenized framed responses; unframed requests remain as legacy compatibility paths.</td>
   </tr>
   <tr>
     <td><code>GET~WEAPON_ENCHANT</code> / <code>WEAPON_ENCHANT</code></td>
