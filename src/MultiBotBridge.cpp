@@ -10,6 +10,7 @@
 #include "GuildMgr.h"
 #include "Item.h"
 #include "ItemPackets.h"
+#include "ItemUsageValue.h"
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "PlayerbotAI.h"
@@ -74,6 +75,7 @@ char const* const kStateFramingCapability = "STATE_FRAMING_V1";
 char const* const kStrategyMutationCapability = "STRATEGY_MUTATION_V1";
 char const* const kOutfitCapability = "OUTFIT_V1";
 char const* const kInventoryCapability = "INVENTORY_V1";
+char const* const kInventoryBulkSellCapability = "INVENTORY_BULK_SELL_V1";
 uint32 constexpr kMaxItemActionCount = 1000;
 
 enum class BridgePayloadStatus
@@ -3613,6 +3615,586 @@ uint32 MoveMatchingGuildBankItemsToBags(Player* requester, Player* bot, uint32 i
     return moved;
 }
 
+bool IsBridgeSellGreyCandidate(PlayerbotAI* botAI, Item* item)
+{
+    if (!botAI || !item)
+        return false;
+
+    ItemTemplate const* const proto = item->GetTemplate();
+    if (!proto)
+        return false;
+
+    if (proto->Quality != ITEM_QUALITY_POOR || !proto->SellPrice)
+        return false;
+
+    if (proto->Class == ITEM_CLASS_QUEST || proto->Class == ITEM_CLASS_KEY)
+        return false;
+
+    // Keep the same explicit protection already enforced by the addon.
+    if (item->GetEntry() == 6948)
+        return false;
+
+    // An active quest objective can require a poor-quality sellable item whose
+    // template is not ITEM_CLASS_QUEST. Reuse Playerbots' audited item-usage
+    // classification and keep the item when it is currently needed for a quest.
+    AiObjectContext* const context = botAI->GetAiObjectContext();
+    if (!context)
+        return false;
+
+    ItemUsage const usage = context->GetValue<ItemUsage>("item usage", item->GetEntry())->Get();
+    if (usage == ITEM_USAGE_QUEST)
+        return false;
+
+    return true;
+}
+
+Creature* FindNearbyInteractiveVendor(Player* bot)
+{
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!bot || !botAI || !botAI->GetAiObjectContext())
+        return nullptr;
+
+    AiObjectContext* const context = botAI->GetAiObjectContext();
+    GuidVector const npcs = *context->GetValue<GuidVector>("nearest npcs");
+    for (ObjectGuid const guid : npcs)
+    {
+        Creature* const creature = bot->GetNPCIfCanInteractWith(guid, UNIT_NPC_FLAG_VENDOR);
+        if (creature)
+            return creature;
+    }
+
+    return nullptr;
+}
+
+void CollectBridgeSellGreyCandidate(PlayerbotAI* botAI, Item* item, std::vector<ObjectGuid>& itemGuids)
+{
+    if (IsBridgeSellGreyCandidate(botAI, item))
+        itemGuids.push_back(item->GetGUID());
+}
+
+uint32 SellGreyBagItems(Player* bot, std::string& reason)
+{
+    if (!bot || !bot->GetSession())
+    {
+        reason = "BAD_REQUEST";
+        return 0;
+    }
+
+    Creature* const vendor = FindNearbyInteractiveVendor(bot);
+    if (!vendor)
+    {
+        reason = "VENDOR_NOT_FOUND";
+        return 0;
+    }
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetAiObjectContext())
+    {
+        reason = "FAILED";
+        return 0;
+    }
+
+    std::vector<ObjectGuid> itemGuids;
+
+    // Snapshot candidate GUIDs before invoking the sell handler so inventory
+    // mutations cannot invalidate the bag iteration.
+    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        CollectBridgeSellGreyCandidate(botAI, bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot), itemGuids);
+
+    for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+    {
+        Bag* const pBag = static_cast<Bag*>(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, bag));
+        if (!pBag)
+            continue;
+
+        for (uint8 slot = 0; slot < pBag->GetBagSize(); ++slot)
+            CollectBridgeSellGreyCandidate(botAI, pBag->GetItemByPos(slot), itemGuids);
+    }
+
+    if (itemGuids.empty())
+    {
+        reason = "ITEM_NOT_FOUND";
+        return 0;
+    }
+
+    uint32 sold = 0;
+
+    for (ObjectGuid const itemGuid : itemGuids)
+    {
+        Item* const item = bot->GetItemByGuid(itemGuid);
+        if (!IsBridgeSellGreyCandidate(botAI, item))
+            continue;
+
+        uint32 const itemId = item->GetEntry();
+        uint32 const before = bot->GetItemCount(itemId, false);
+        uint32 const moneyBefore = bot->GetMoney();
+
+        WorldPacket packet(CMSG_SELL_ITEM);
+        packet << vendor->GetGUID() << itemGuid << uint32(0);
+
+        WorldPackets::Item::SellItem sellPacket(std::move(packet));
+        sellPacket.Read();
+        bot->GetSession()->HandleSellItemOpcode(sellPacket);
+
+        // Match Playerbots SellAction semantics when the gold cheat is active,
+        // without calling SellAction/TellMaster and therefore without chat spam.
+        if (botAI->HasCheat(BotCheatMask::gold))
+            bot->SetMoney(moneyBefore);
+
+        uint32 const after = bot->GetItemCount(itemId, false);
+        if (before > after)
+            sold += before - after;
+    }
+
+    if (!sold && reason.empty())
+        reason = "FAILED";
+
+    return sold;
+}
+
+void AddBridgeCraftOutputsFromSpellInfo(SpellInfo const* spellInfo, std::set<uint32>& itemIds)
+{
+    if (!spellInfo)
+        return;
+
+    for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+    {
+        SpellEffectInfo const& effect = spellInfo->Effects[i];
+        if ((effect.Effect == SPELL_EFFECT_CREATE_ITEM || effect.Effect == SPELL_EFFECT_CREATE_ITEM_2) &&
+            effect.ItemType > 0)
+            itemIds.insert(static_cast<uint32>(effect.ItemType));
+    }
+}
+
+void AddBridgeCraftOutputsFromSpell(uint32 spellId, std::set<uint32>& itemIds,
+                                    std::set<uint32>* visitedSpellIds = nullptr)
+{
+    std::set<uint32> visitedSpells;
+    std::vector<uint32> pendingSpells;
+    pendingSpells.push_back(spellId);
+
+    while (!pendingSpells.empty())
+    {
+        uint32 const currentSpellId = pendingSpells.back();
+        pendingSpells.pop_back();
+
+        if (!currentSpellId || !visitedSpells.insert(currentSpellId).second)
+            continue;
+
+        SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(currentSpellId);
+        if (!spellInfo)
+            continue;
+
+        if (visitedSpellIds)
+            visitedSpellIds->insert(currentSpellId);
+
+        AddBridgeCraftOutputsFromSpellInfo(spellInfo, itemIds);
+
+        // Follow the complete TriggerSpell graph. The visited set prevents
+        // cycles while preserving every concrete create-item output reachable
+        // from a profession or recipe spell.
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+        {
+            uint32 const triggerSpell = spellInfo->Effects[i].TriggerSpell;
+            if (triggerSpell && visitedSpells.find(triggerSpell) == visitedSpells.end())
+                pendingSpells.push_back(triggerSpell);
+        }
+    }
+}
+
+uint32 GetBridgeRecipeSkillId(ItemTemplate const* recipe)
+{
+    if (!recipe || recipe->Class != ITEM_CLASS_RECIPE)
+        return 0;
+
+    switch (recipe->SubClass)
+    {
+        case ITEM_SUBCLASS_LEATHERWORKING_PATTERN: return SKILL_LEATHERWORKING;
+        case ITEM_SUBCLASS_TAILORING_PATTERN: return SKILL_TAILORING;
+        case ITEM_SUBCLASS_ENGINEERING_SCHEMATIC: return SKILL_ENGINEERING;
+        case ITEM_SUBCLASS_BLACKSMITHING: return SKILL_BLACKSMITHING;
+        case ITEM_SUBCLASS_COOKING_RECIPE: return SKILL_COOKING;
+        case ITEM_SUBCLASS_ALCHEMY_RECIPE: return SKILL_ALCHEMY;
+        case ITEM_SUBCLASS_FIRST_AID_MANUAL: return SKILL_FIRST_AID;
+        case ITEM_SUBCLASS_ENCHANTING_FORMULA: return SKILL_ENCHANTING;
+        case ITEM_SUBCLASS_JEWELCRAFTING_RECIPE: return SKILL_JEWELCRAFTING;
+        case ITEM_SUBCLASS_FISHING_MANUAL: return SKILL_FISHING;
+        default: return 0;
+    }
+}
+
+std::array<SkillType, 14> const& GetBridgeCraftProtectionSkills()
+{
+    static std::array<SkillType, 14> const skills = {
+        SKILL_ALCHEMY,
+        SKILL_ENCHANTING,
+        SKILL_SKINNING,
+        SKILL_TAILORING,
+        SKILL_LEATHERWORKING,
+        SKILL_ENGINEERING,
+        SKILL_HERBALISM,
+        SKILL_INSCRIPTION,
+        SKILL_MINING,
+        SKILL_BLACKSMITHING,
+        SKILL_COOKING,
+        SKILL_FIRST_AID,
+        SKILL_FISHING,
+        SKILL_JEWELCRAFTING
+    };
+
+    return skills;
+}
+
+using BridgeReferenceLootRows = std::map<uint32, std::vector<std::pair<uint32, uint32>>>;
+
+BridgeReferenceLootRows BuildBridgeReferenceLootRows()
+{
+    BridgeReferenceLootRows rows;
+
+    QueryResult result = WorldDatabase.Query(
+        "SELECT Entry, Item, Reference FROM reference_loot_template");
+    if (!result)
+        return rows;
+
+    do
+    {
+        Field* const fields = result->Fetch();
+        uint32 const entryId = fields[0].Get<uint32>();
+        uint32 const itemId = fields[1].Get<uint32>();
+        uint32 const referenceId = fields[2].Get<uint32>();
+
+        if (entryId)
+            rows[entryId].push_back({itemId, referenceId});
+    } while (result->NextRow());
+
+    return rows;
+}
+
+BridgeReferenceLootRows BuildBridgeLootTableRows(char const* tableName)
+{
+    BridgeReferenceLootRows rows;
+
+    QueryResult result = WorldDatabase.Query(
+        "SELECT Entry, Item, Reference FROM {}", tableName);
+    if (!result)
+        return rows;
+
+    do
+    {
+        Field* const fields = result->Fetch();
+        uint32 const entryId = fields[0].Get<uint32>();
+        uint32 const itemId = fields[1].Get<uint32>();
+        uint32 const referenceId = fields[2].Get<uint32>();
+
+        if (entryId)
+            rows[entryId].push_back({itemId, referenceId});
+    } while (result->NextRow());
+
+    return rows;
+}
+
+void AddBridgeReferenceLootOutputs(std::set<uint32> const& initialReferences,
+                                   BridgeReferenceLootRows const& referenceRows,
+                                   std::set<uint32>& itemIds)
+{
+    std::set<uint32> visitedReferences;
+    std::vector<uint32> pendingReferences(initialReferences.begin(), initialReferences.end());
+
+    while (!pendingReferences.empty())
+    {
+        uint32 const referenceId = pendingReferences.back();
+        pendingReferences.pop_back();
+
+        if (!referenceId || !visitedReferences.insert(referenceId).second)
+            continue;
+
+        auto const rowsIt = referenceRows.find(referenceId);
+        if (rowsIt == referenceRows.end())
+            continue;
+
+        for (auto const& row : rowsIt->second)
+        {
+            if (row.first)
+                itemIds.insert(row.first);
+
+            if (row.second && visitedReferences.find(row.second) == visitedReferences.end())
+                pendingReferences.push_back(row.second);
+        }
+    }
+}
+
+void AddBridgeLootEntryOutputs(uint32 entryId,
+                               BridgeReferenceLootRows const& lootRows,
+                               BridgeReferenceLootRows const& referenceRows,
+                               std::set<uint32>& itemIds)
+{
+    auto const rowsIt = lootRows.find(entryId);
+    if (!entryId || rowsIt == lootRows.end())
+        return;
+
+    std::set<uint32> references;
+    for (auto const& row : rowsIt->second)
+    {
+        if (row.first)
+            itemIds.insert(row.first);
+
+        if (row.second)
+            references.insert(row.second);
+    }
+
+    AddBridgeReferenceLootOutputs(references, referenceRows, itemIds);
+}
+
+void AddBridgeCraftAndSpellLootOutputs(uint32 spellId,
+                                       BridgeReferenceLootRows const& spellLootRows,
+                                       BridgeReferenceLootRows const& referenceRows,
+                                       std::set<uint32>& itemIds)
+{
+    std::set<uint32> visitedSpellIds;
+    AddBridgeCraftOutputsFromSpell(spellId, itemIds, &visitedSpellIds);
+
+    for (uint32 const visitedSpellId : visitedSpellIds)
+        AddBridgeLootEntryOutputs(visitedSpellId, spellLootRows, referenceRows, itemIds);
+}
+
+void AddBridgeLootTableOutputs(char const* tableName,
+                               BridgeReferenceLootRows const& referenceRows,
+                               std::set<uint32>& itemIds)
+{
+    QueryResult result = WorldDatabase.Query("SELECT Item, Reference FROM {}", tableName);
+    if (!result)
+        return;
+
+    std::set<uint32> references;
+    do
+    {
+        Field* const fields = result->Fetch();
+        uint32 const itemId = fields[0].Get<uint32>();
+        uint32 const referenceId = fields[1].Get<uint32>();
+
+        if (itemId)
+            itemIds.insert(itemId);
+
+        if (referenceId)
+            references.insert(referenceId);
+    } while (result->NextRow());
+
+    AddBridgeReferenceLootOutputs(references, referenceRows, itemIds);
+}
+std::map<uint32, std::set<uint32>> const& GetBridgeCraftOutputsBySkill()
+{
+    // The source data is process-wide and immutable for normal runtime use.
+    // Function-local static initialization is thread-safe, so the expensive
+    // SkillLineAbility, item-template, and loot-table scans run only once.
+    static std::map<uint32, std::set<uint32>> const outputsBySkill = []()
+    {
+        std::map<uint32, std::set<uint32>> outputs;
+
+        BridgeReferenceLootRows const referenceLootRows = BuildBridgeReferenceLootRows();
+        BridgeReferenceLootRows const spellLootRows =
+            BuildBridgeLootTableRows("spell_loot_template");
+
+        for (SkillType const skill : GetBridgeCraftProtectionSkills())
+        {
+            uint32 const skillId = static_cast<uint32>(skill);
+            std::set<uint32>& skillOutputs = outputs[skillId];
+
+            for (SkillLineAbilityEntry const* const ability : GetSkillLineAbilitiesBySkillLine(skillId))
+            {
+                if (ability)
+                    AddBridgeCraftAndSpellLootOutputs(
+                        ability->Spell, spellLootRows, referenceLootRows, skillOutputs);
+            }
+        }
+
+        // Conservative recipe fallback audited from Playerbots. Scan the item
+        // template store once, then attach each recognized recipe output to the
+        // corresponding profession set. Random spell-loot outputs and every
+        // reachable TriggerSpell are covered by the same helper.
+        std::vector<ItemTemplate*> const* const itemTemplates = sObjectMgr->GetItemTemplateStoreFast();
+        if (itemTemplates)
+        {
+            for (ItemTemplate const* const recipe : *itemTemplates)
+            {
+                uint32 const skillId = GetBridgeRecipeSkillId(recipe);
+                auto const outputIt = outputs.find(skillId);
+                if (!skillId || outputIt == outputs.end())
+                    continue;
+
+                for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+                {
+                    uint32 const spellId = recipe->Spells[i].SpellId;
+                    if (spellId)
+                        AddBridgeCraftAndSpellLootOutputs(
+                            spellId, spellLootRows, referenceLootRows, outputIt->second);
+                }
+            }
+        }
+
+        // Prospecting, milling, and disenchanting use dedicated loot templates.
+        // Include every possible output and follow reference_loot_template
+        // recursively in the same process-wide cache used by SELL_VENDOR.
+        AddBridgeLootTableOutputs(
+            "prospecting_loot_template", referenceLootRows,
+            outputs[static_cast<uint32>(SKILL_JEWELCRAFTING)]);
+        AddBridgeLootTableOutputs(
+            "milling_loot_template", referenceLootRows,
+            outputs[static_cast<uint32>(SKILL_INSCRIPTION)]);
+        AddBridgeLootTableOutputs(
+            "disenchant_loot_template", referenceLootRows,
+            outputs[static_cast<uint32>(SKILL_ENCHANTING)]);
+
+        return outputs;
+    }();
+
+    return outputsBySkill;
+}
+
+std::set<uint32> BuildBridgeCraftProtectedItemIds(PlayerbotAI* botAI)
+{
+    std::set<uint32> itemIds;
+    if (!botAI)
+        return itemIds;
+
+    std::map<uint32, std::set<uint32>> const& outputsBySkill = GetBridgeCraftOutputsBySkill();
+
+    for (SkillType const skill : GetBridgeCraftProtectionSkills())
+    {
+        if (!botAI->HasSkill(skill))
+            continue;
+
+        auto const outputIt = outputsBySkill.find(static_cast<uint32>(skill));
+        if (outputIt != outputsBySkill.end())
+            itemIds.insert(outputIt->second.begin(), outputIt->second.end());
+    }
+
+    return itemIds;
+}
+
+bool IsBridgeSellVendorCandidate(Player* bot, PlayerbotAI* botAI, Item* item,
+                                 std::set<uint32> const& protectedCraftItemIds)
+{
+    if (!bot || !botAI || !item)
+        return false;
+
+    ItemTemplate const* const proto = item->GetTemplate();
+    if (!proto || !proto->SellPrice)
+        return false;
+
+    if (proto->Class == ITEM_CLASS_QUEST || proto->Class == ITEM_CLASS_KEY)
+        return false;
+
+    if (item->GetEntry() == 6948)
+        return false;
+
+    // Fail-safe workaround for the audited Playerbots ammo-class condition bug.
+    if (proto->Class == ITEM_CLASS_PROJECTILE)
+        return false;
+
+    // Exact signed-craft protection.
+    if (item->GetGuidValue(ITEM_FIELD_CREATOR) == bot->GetGUID())
+        return false;
+
+    // Conservative protection for unsigned/stackable profession outputs.
+    if (protectedCraftItemIds.find(item->GetEntry()) != protectedCraftItemIds.end())
+        return false;
+
+    AiObjectContext* const context = botAI->GetAiObjectContext();
+    if (!context)
+        return false;
+
+    ItemUsage const usage = context->GetValue<ItemUsage>("item usage", item->GetEntry())->Get();
+    return usage == ITEM_USAGE_VENDOR || usage == ITEM_USAGE_AH;
+}
+
+void CollectBridgeSellVendorCandidate(Player* bot, PlayerbotAI* botAI, Item* item,
+                                      std::set<uint32> const& protectedCraftItemIds,
+                                      std::vector<ObjectGuid>& itemGuids)
+{
+    if (IsBridgeSellVendorCandidate(bot, botAI, item, protectedCraftItemIds))
+        itemGuids.push_back(item->GetGUID());
+}
+
+uint32 SellVendorBagItems(Player* bot, std::string& reason)
+{
+    if (!bot || !bot->GetSession())
+    {
+        reason = "BAD_REQUEST";
+        return 0;
+    }
+
+    Creature* const vendor = FindNearbyInteractiveVendor(bot);
+    if (!vendor)
+    {
+        reason = "VENDOR_NOT_FOUND";
+        return 0;
+    }
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetAiObjectContext())
+    {
+        reason = "FAILED";
+        return 0;
+    }
+
+    std::set<uint32> const protectedCraftItemIds = BuildBridgeCraftProtectedItemIds(botAI);
+    std::vector<ObjectGuid> itemGuids;
+
+    // Snapshot GUIDs before native selling. Uncertainty means keep.
+    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        CollectBridgeSellVendorCandidate(
+            bot, botAI, bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot), protectedCraftItemIds, itemGuids);
+
+    for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+    {
+        Bag* const pBag = static_cast<Bag*>(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, bag));
+        if (!pBag)
+            continue;
+
+        for (uint8 slot = 0; slot < pBag->GetBagSize(); ++slot)
+            CollectBridgeSellVendorCandidate(
+                bot, botAI, pBag->GetItemByPos(slot), protectedCraftItemIds, itemGuids);
+    }
+
+    if (itemGuids.empty())
+    {
+        reason = "ITEM_NOT_FOUND";
+        return 0;
+    }
+
+    uint32 sold = 0;
+
+    for (ObjectGuid const itemGuid : itemGuids)
+    {
+        Item* const item = bot->GetItemByGuid(itemGuid);
+        if (!IsBridgeSellVendorCandidate(bot, botAI, item, protectedCraftItemIds))
+            continue;
+
+        uint32 const itemId = item->GetEntry();
+        uint32 const before = bot->GetItemCount(itemId, false);
+        uint32 const moneyBefore = bot->GetMoney();
+
+        WorldPacket packet(CMSG_SELL_ITEM);
+        packet << vendor->GetGUID() << itemGuid << uint32(0);
+
+        WorldPackets::Item::SellItem sellPacket(std::move(packet));
+        sellPacket.Read();
+        bot->GetSession()->HandleSellItemOpcode(sellPacket);
+
+        if (botAI->HasCheat(BotCheatMask::gold))
+            bot->SetMoney(moneyBefore);
+
+        uint32 const after = bot->GetItemCount(itemId, false);
+        if (before > after)
+            sold += before - after;
+    }
+
+    if (!sold && reason.empty())
+        reason = "FAILED";
+
+    return sold;
+}
+
 uint32 BuyMatchingVendorItem(Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
 {
     if (!bot || !itemId)
@@ -3712,8 +4294,17 @@ void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::st
     std::string const action = ToUpper(Trim(actionValue));
     uint32 itemId = 0;
     uint32 requestedCount = 0;
-    TryParseUint32Field(Trim(itemIdValue), 1, std::numeric_limits<uint32>::max(), itemId);
-    TryParseUint32Field(Trim(countValue), 0, kMaxItemActionCount, requestedCount);
+    bool sellParamsInvalid = false;
+    if (action == "SELL_GREY" || action == "SELL_VENDOR")
+    {
+        if (Trim(itemIdValue) != "0" || Trim(countValue) != "0")
+            sellParamsInvalid = true;
+    }
+    else
+    {
+        TryParseUint32Field(Trim(itemIdValue), 1, std::numeric_limits<uint32>::max(), itemId);
+        TryParseUint32Field(Trim(countValue), 0, kMaxItemActionCount, requestedCount);
+    }
 
     Player* const bot = FindBotByName(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
@@ -3746,6 +4337,20 @@ void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::st
             moved = MoveMatchingGuildBankItemsToBags(requester, bot, itemId, requestedCount, reason);
         else if (action == "BUY_ITEM")
             moved = BuyMatchingVendorItem(bot, itemId, requestedCount, reason);
+        else if (action == "SELL_GREY")
+        {
+            if (sellParamsInvalid)
+                reason = "BAD_REQUEST";
+            else
+                moved = SellGreyBagItems(bot, reason);
+        }
+        else if (action == "SELL_VENDOR")
+        {
+            if (sellParamsInvalid)
+                reason = "BAD_REQUEST";
+            else
+                moved = SellVendorBagItems(bot, reason);
+        }
         else
             reason = "BAD_ACTION";
     }
@@ -5548,7 +6153,7 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             player,
             replyType,
             "CAPS",
-            std::string(kStateFramingCapability) + "," + kStrategyMutationCapability + "," + kOutfitCapability + "," + kInventoryCapability);
+            std::string(kStateFramingCapability) + "," + kStrategyMutationCapability + "," + kOutfitCapability + "," + kInventoryCapability + "," + kInventoryBulkSellCapability);
         return true;
     }
 
@@ -5953,8 +6558,14 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
 
         uint32 itemId = 0;
         uint32 count = 0;
-        if (!TryParseUint32Field(fields[4], 1, std::numeric_limits<uint32>::max(), itemId) ||
-            !TryParseUint32Field(fields[5], 0, kMaxItemActionCount, count))
+        std::string const itemAction = ToUpper(fields[3]);
+        if (itemAction == "SELL_GREY" || itemAction == "SELL_VENDOR")
+        {
+            if (fields[4] != "0" || fields[5] != "0")
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_NUMBER");
+        }
+        else if (!TryParseUint32Field(fields[4], 1, std::numeric_limits<uint32>::max(), itemId) ||
+                 !TryParseUint32Field(fields[5], 0, kMaxItemActionCount, count))
         {
             return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_NUMBER");
         }
