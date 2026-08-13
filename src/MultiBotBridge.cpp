@@ -1,3 +1,4 @@
+#include "Bag.h"
 #include "Chat.h"
 #include "Config.h"
 #include "Creature.h"
@@ -11,6 +12,7 @@
 #include "Item.h"
 #include "ItemPackets.h"
 #include "ItemUsageValue.h"
+#include "LootObjectStack.h"
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "PlayerbotAI.h"
@@ -20,6 +22,8 @@
 #include "RandomPlayerbotMgr.h"
 #include "ReputationMgr.h"
 #include "AiObjectContext.h"
+#include "Event.h"
+#include "Trigger.h"
 #include "Formations.h"
 #include "ScriptedGossip.h"
 #include "ScriptMgr.h"
@@ -76,6 +80,7 @@ char const* const kStrategyMutationCapability = "STRATEGY_MUTATION_V1";
 char const* const kOutfitCapability = "OUTFIT_V1";
 char const* const kInventoryCapability = "INVENTORY_V1";
 char const* const kInventoryBulkSellCapability = "INVENTORY_BULK_SELL_V1";
+char const* const kInventoryOpenCapability = "INVENTORY_OPEN_V1";
 uint32 constexpr kMaxItemActionCount = 1000;
 
 enum class BridgePayloadStatus
@@ -4294,11 +4299,11 @@ void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::st
     std::string const action = ToUpper(Trim(actionValue));
     uint32 itemId = 0;
     uint32 requestedCount = 0;
-    bool sellParamsInvalid = false;
-    if (action == "SELL_GREY" || action == "SELL_VENDOR")
+    bool zeroParamsInvalid = false;
+    if (action == "SELL_GREY" || action == "SELL_VENDOR" || action == "OPEN_ITEMS")
     {
         if (Trim(itemIdValue) != "0" || Trim(countValue) != "0")
-            sellParamsInvalid = true;
+            zeroParamsInvalid = true;
     }
     else
     {
@@ -4339,17 +4344,125 @@ void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::st
             moved = BuyMatchingVendorItem(bot, itemId, requestedCount, reason);
         else if (action == "SELL_GREY")
         {
-            if (sellParamsInvalid)
+            if (zeroParamsInvalid)
                 reason = "BAD_REQUEST";
             else
                 moved = SellGreyBagItems(bot, reason);
         }
         else if (action == "SELL_VENDOR")
         {
-            if (sellParamsInvalid)
+            if (zeroParamsInvalid)
                 reason = "BAD_REQUEST";
             else
                 moved = SellVendorBagItems(bot, reason);
+        }
+        else if (action == "OPEN_ITEMS")
+        {
+            if (zeroParamsInvalid)
+            {
+                reason = "BAD_REQUEST";
+            }
+            else if (!bot->GetSession())
+            {
+                reason = "NO_SESSION";
+            }
+            else
+            {
+                // MB_OPEN_ITEMS_RESIDUAL_V1_BEGIN
+                // OPEN_ITEMS is manual/residual only. Playerbots already runs "open items"
+                // automatically from the "item push result" world-packet trigger.
+                AiObjectContext* const context = botAI->GetAiObjectContext();
+                if (!context)
+                {
+                    reason = "OPEN_FAILED";
+                }
+                else
+                {
+                    bool autoOpenPending = false;
+                    Trigger* const itemPushTrigger = context->GetTrigger("item push result");
+                    if (itemPushTrigger)
+                    {
+                        Event pendingItemPush = itemPushTrigger->Check();
+                        autoOpenPending = !pendingItemPush.getPacket().empty();
+                    }
+
+                    if (autoOpenPending)
+                    {
+                        reason = "AUTO_OPEN_PENDING";
+                    }
+                    else
+                    {
+                        auto isResidualOpenable = [bot](Item* candidate) -> bool
+                        {
+                            if (!candidate || candidate->m_lootGenerated)
+                                return false;
+
+                            ItemTemplate const* const itemTemplate = candidate->GetTemplate();
+                            if (!itemTemplate || bot->CanUseItem(itemTemplate) != EQUIP_ERR_OK ||
+                                !itemTemplate->HasFlag(ITEM_FLAG_HAS_LOOT))
+                            {
+                                return false;
+                            }
+
+                            if (itemTemplate->LockID != 0 && candidate->IsLocked())
+                                return false;
+
+                            return true;
+                        };
+
+                        Item* item = nullptr;
+                        for (uint8 slot = INVENTORY_SLOT_ITEM_START; !item && slot < INVENTORY_SLOT_ITEM_END; ++slot)
+                        {
+                            Item* const candidate = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+                            if (isResidualOpenable(candidate))
+                                item = candidate;
+                        }
+
+                        for (uint8 bag = INVENTORY_SLOT_BAG_START; !item && bag < INVENTORY_SLOT_BAG_END; ++bag)
+                        {
+                            Bag* const container = bot->GetBagByPos(bag);
+                            if (!container)
+                                continue;
+
+                            for (uint32 slot = 0; !item && slot < container->GetBagSize(); ++slot)
+                            {
+                                Item* const candidate = bot->GetItemByPos(bag, static_cast<uint8>(slot));
+                                if (isResidualOpenable(candidate))
+                                    item = candidate;
+                            }
+                        }
+
+                        if (!item)
+                        {
+                            reason = "NO_OPENABLE_ITEM";
+                        }
+                        else
+                        {
+                            uint8 const bag = item->GetBagSlot();
+                            uint8 const slot = item->GetSlot();
+                            ObjectGuid const itemGuid = item->GetGUID();
+                            itemId = item->GetEntry();
+
+                            WorldPacket packet(CMSG_OPEN_ITEM);
+                            packet << bag << slot;
+                            bot->GetSession()->HandleOpenItemOpcode(packet);
+
+                            if (item->m_lootGenerated)
+                            {
+                                LootObject lootObject;
+                                lootObject.guid = itemGuid;
+                                context->GetValue<LootObject>("loot target")->Set(lootObject);
+                                moved = 1;
+                            }
+                            else
+                            {
+                                reason = "OPEN_FAILED";
+                            }
+                        }
+                    }
+                }
+                // MB_OPEN_ITEMS_RESIDUAL_V1_END
+            }
         }
         else
             reason = "BAD_ACTION";
@@ -6153,7 +6266,7 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             player,
             replyType,
             "CAPS",
-            std::string(kStateFramingCapability) + "," + kStrategyMutationCapability + "," + kOutfitCapability + "," + kInventoryCapability + "," + kInventoryBulkSellCapability);
+            std::string(kStateFramingCapability) + "," + kStrategyMutationCapability + "," + kOutfitCapability + "," + kInventoryCapability + "," + kInventoryBulkSellCapability + "," + kInventoryOpenCapability);
         return true;
     }
 
@@ -6559,7 +6672,7 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         uint32 itemId = 0;
         uint32 count = 0;
         std::string const itemAction = ToUpper(fields[3]);
-        if (itemAction == "SELL_GREY" || itemAction == "SELL_VENDOR")
+        if (itemAction == "SELL_GREY" || itemAction == "SELL_VENDOR" || itemAction == "OPEN_ITEMS")
         {
             if (fields[4] != "0" || fields[5] != "0")
                 return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_NUMBER");
