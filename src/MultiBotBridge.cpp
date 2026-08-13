@@ -4371,89 +4371,93 @@ void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::st
                 // MB_OPEN_ITEMS_RESIDUAL_V1_BEGIN
                 // OPEN_ITEMS is manual/residual only. Playerbots already runs "open items"
                 // automatically from the "item push result" world-packet trigger.
-                bool autoOpenPending = false;
-                Trigger* const itemPushTrigger = botAI->GetAiObjectContext()->GetTrigger("item push result");
-                if (itemPushTrigger)
+                AiObjectContext* const context = botAI->GetAiObjectContext();
+                if (!context)
                 {
-                    Event pendingItemPush = itemPushTrigger->Check();
-                    autoOpenPending = !pendingItemPush.getPacket().empty();
-                }
-
-                if (autoOpenPending)
-                {
-                    reason = "AUTO_OPEN_PENDING";
+                    reason = "OPEN_FAILED";
                 }
                 else
                 {
-                    auto isResidualOpenable = [bot](Item* candidate) -> bool
+                    bool autoOpenPending = false;
+                    Trigger* const itemPushTrigger = context->GetTrigger("item push result");
+                    if (itemPushTrigger)
                     {
-                        if (!candidate || candidate->m_lootGenerated)
-                            return false;
-
-                        ItemTemplate const* const itemTemplate = candidate->GetTemplate();
-                        if (!itemTemplate || bot->CanUseItem(itemTemplate) != EQUIP_ERR_OK ||
-                            !itemTemplate->HasFlag(ITEM_FLAG_HAS_LOOT))
-                        {
-                            return false;
-                        }
-
-                        if (itemTemplate->LockID != 0)
-                        {
-                            Item* const byEntry = bot->GetItemByEntry(itemTemplate->ItemId);
-                            if (!byEntry || byEntry->IsLocked())
-                                return false;
-                        }
-
-                        return true;
-                    };
-
-                    Item* item = nullptr;
-                    for (uint8 slot = INVENTORY_SLOT_ITEM_START; !item && slot < INVENTORY_SLOT_ITEM_END; ++slot)
-                    {
-                        Item* const candidate = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
-                        if (isResidualOpenable(candidate))
-                            item = candidate;
+                        Event pendingItemPush = itemPushTrigger->Check();
+                        autoOpenPending = !pendingItemPush.getPacket().empty();
                     }
 
-                    for (uint8 bag = INVENTORY_SLOT_BAG_START; !item && bag < INVENTORY_SLOT_BAG_END; ++bag)
+                    if (autoOpenPending)
                     {
-                        Bag* const container = bot->GetBagByPos(bag);
-                        if (!container)
-                            continue;
-
-                        for (uint32 slot = 0; !item && slot < container->GetBagSize(); ++slot)
-                        {
-                            Item* const candidate = bot->GetItemByPos(bag, static_cast<uint8>(slot));
-                            if (isResidualOpenable(candidate))
-                                item = candidate;
-                        }
-                    }
-
-                    if (!item)
-                    {
-                        reason = "NO_OPENABLE_ITEM";
+                        reason = "AUTO_OPEN_PENDING";
                     }
                     else
                     {
-                        uint8 const bag = item->GetBagSlot();
-                        uint8 const slot = item->GetSlot();
-                        ObjectGuid const itemGuid = item->GetGUID();
-                        itemId = item->GetEntry();
-
-                        WorldPacket packet(CMSG_OPEN_ITEM);
-                        packet << bag << slot;
-                        bot->GetSession()->HandleOpenItemOpcode(packet);
-
-                        if (item->m_lootGenerated)
+                        auto isResidualOpenable = [bot](Item* candidate) -> bool
                         {
-                            LootObject lootObject;
-                            lootObject.guid = itemGuid;
-                            botAI->GetAiObjectContext()->GetValue<LootObject>("loot target")->Set(lootObject);
-                            moved = 1;
+                            if (!candidate || candidate->m_lootGenerated)
+                                return false;
+
+                            ItemTemplate const* const itemTemplate = candidate->GetTemplate();
+                            if (!itemTemplate || bot->CanUseItem(itemTemplate) != EQUIP_ERR_OK ||
+                                !itemTemplate->HasFlag(ITEM_FLAG_HAS_LOOT))
+                            {
+                                return false;
+                            }
+
+                            if (itemTemplate->LockID != 0 && candidate->IsLocked())
+                                return false;
+
+                            return true;
+                        };
+
+                        Item* item = nullptr;
+                        for (uint8 slot = INVENTORY_SLOT_ITEM_START; !item && slot < INVENTORY_SLOT_ITEM_END; ++slot)
+                        {
+                            Item* const candidate = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+                            if (isResidualOpenable(candidate))
+                                item = candidate;
+                        }
+
+                        for (uint8 bag = INVENTORY_SLOT_BAG_START; !item && bag < INVENTORY_SLOT_BAG_END; ++bag)
+                        {
+                            Bag* const container = bot->GetBagByPos(bag);
+                            if (!container)
+                                continue;
+
+                            for (uint32 slot = 0; !item && slot < container->GetBagSize(); ++slot)
+                            {
+                                Item* const candidate = bot->GetItemByPos(bag, static_cast<uint8>(slot));
+                                if (isResidualOpenable(candidate))
+                                    item = candidate;
+                            }
+                        }
+
+                        if (!item)
+                        {
+                            reason = "NO_OPENABLE_ITEM";
                         }
                         else
                         {
-                            reason = "OPEN_FAILED";
+                            uint8 const bag = item->GetBagSlot();
+                            uint8 const slot = item->GetSlot();
+                            ObjectGuid const itemGuid = item->GetGUID();
+                            itemId = item->GetEntry();
+
+                            WorldPacket packet(CMSG_OPEN_ITEM);
+                            packet << bag << slot;
+                            bot->GetSession()->HandleOpenItemOpcode(packet);
+
+                            if (item->m_lootGenerated)
+                            {
+                                LootObject lootObject;
+                                lootObject.guid = itemGuid;
+                                context->GetValue<LootObject>("loot target")->Set(lootObject);
+                                moved = 1;
+                            }
+                            else
+                            {
+                                reason = "OPEN_FAILED";
+                            }
                         }
                     }
                 }
