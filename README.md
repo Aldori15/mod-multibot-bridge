@@ -596,6 +596,8 @@ Formation selection and inspection are also bridge-first. `RUN~FORMATION` applie
 
 The Enchanting Trade Service is intentionally narrower than a generic cast endpoint. `ENCHANT_TRADE_V1` discovers only spells the selected bot actually knows that belong to the Enchanting skill line and contain a valid non-soulbinding `SPELL_EFFECT_ENCHANT_ITEM`. Execution accepts only the numeric spell ID, revalidates the requester/bot Trade relationship and `TRADE_SLOT_NONTRADED`, then uses native `SpellCastTargets::SetTradeItemTarget()` and Core `Spell::prepare()`. The normal Trade accept path performs Core validation again before the enchant is finalized.
 
+Discovery responses are capped at 256 enchantment entries. `ENCHANT_TRADE_END` reports the number of `ENCHANT_TRADE_ITEM` entries actually sent after that cap and per-packet budget checks.
+
 Runtime validation on 2026-08-14 confirmed list retrieval, reagent/tool status, native Trade-window targeting and a real item enchant. No generic Playerbots command/cast executor or automatic chat path is exposed by this capability.
 
 ## Warlock strategy selectors and stone switching

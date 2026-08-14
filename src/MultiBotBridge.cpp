@@ -4793,7 +4793,7 @@ void SendEnchantTradePackets(Player* requester, ChatMsg replyType, std::string c
     std::string const trimmedBotName = Trim(botName);
     std::string const token = Trim(requestToken);
     Player* const bot = FindBotByName(requester, trimmedBotName);
-    std::string const effectiveBotName = bot ? bot->GetName() : "";
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
     std::string reason = "OK";
 
     if (!ConsumeEnchantTradeRateLimit(requester))
@@ -4936,7 +4936,7 @@ void RunEnchantTradeCommand(Player* requester, ChatMsg replyType, std::string co
     TryParseUint32Field(Trim(spellIdValue), 1, std::numeric_limits<uint32>::max(), spellId);
 
     Player* const bot = FindBotByName(requester, trimmedBotName);
-    std::string const effectiveBotName = bot ? bot->GetName() : "";
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
     std::string reason = "OK";
     bool accepted = false;
 
@@ -4953,10 +4953,25 @@ void RunEnchantTradeCommand(Player* requester, ChatMsg replyType, std::string co
             SpellCastTargets targets;
             targets.SetTradeItemTarget(bot);
 
-            Spell* const spell = new Spell(bot, spellInfo, TRIGGERED_NONE);
-            SpellCastResult const result = spell->prepare(&targets);
+            // Mirror the native TradeHandler validation path without preparing a
+            // heap-allocated Spell here. The Core owns final spell preparation
+            // when the normal trade is accepted.
+            Spell spell(bot, spellInfo, TRIGGERED_FULL_MASK);
+            spell.m_targets = targets;
+            SpellCastResult const result = spell.CheckCast(true);
             reason = GetSpellCastFailureReason(result);
-            accepted = result == SPELL_CAST_OK;
+
+            if (result == SPELL_CAST_OK)
+            {
+                TradeData* const botTrade = bot->GetTradeData();
+                if (!botTrade)
+                    reason = "NO_TRADE";
+                else
+                {
+                    botTrade->SetSpell(spellId);
+                    accepted = true;
+                }
+            }
         }
     }
 
