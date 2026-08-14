@@ -4836,17 +4836,21 @@ void SendEnchantTradePackets(Player* requester, ChatMsg replyType, std::string c
                 << kFieldSeparator << entry.spellId
                 << kFieldSeparator << UrlEncodeField(entry.difficulty)
                 << kFieldSeparator << entry.available
-                << kFieldSeparator << entry.hasTools;
+                << kFieldSeparator << entry.hasTools
+                << kFieldSeparator << entry.materials.size();
             if (!IsAddonPacketWithinBudget("ENCHANT_TRADE_ITEM", payload.str()))
                 continue;
 
             SendAddonPacket(requester, replyType, "ENCHANT_TRADE_ITEM", payload.str());
+            uint32 materialIndex = 0;
             for (EnchantTradeMaterialData const& material : entry.materials)
             {
+                ++materialIndex;
                 std::ostringstream materialPayload;
                 materialPayload << UrlEncodeField(effectiveBotName)
                     << kFieldSeparator << token
                     << kFieldSeparator << entry.spellId
+                    << kFieldSeparator << materialIndex
                     << kFieldSeparator << material.itemId
                     << kFieldSeparator << material.required
                     << kFieldSeparator << material.available;

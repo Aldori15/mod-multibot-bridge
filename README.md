@@ -338,8 +338,8 @@ Server -> Addon:  MBOT GROUP_ROLL_ACK~<token>~<status>~<mode>~<scope>~<matched>~
 
 Addon  -> Server: MBOT GET~ENCHANT_TRADE~<botName>~<token>
 Server -> Addon:  MBOT ENCHANT_TRADE_BEGIN~<botName>~<token>~<status>~<reason>~<skill>~<maxSkill>
-Server -> Addon:  MBOT ENCHANT_TRADE_ITEM~<botName>~<token>~<spellId>~<difficulty>~<available>~<hasTools>
-Server -> Addon:  MBOT ENCHANT_TRADE_MATERIAL~<botName>~<token>~<spellId>~<itemId>~<required>~<available>
+Server -> Addon:  MBOT ENCHANT_TRADE_ITEM~<botName>~<token>~<spellId>~<difficulty>~<available>~<hasTools>~<materialCount>
+Server -> Addon:  MBOT ENCHANT_TRADE_MATERIAL~<botName>~<token>~<spellId>~<materialIndex>~<itemId>~<required>~<available>
 Server -> Addon:  MBOT ENCHANT_TRADE_END~<botName>~<token>~<status>~<reason>~<count>
 
 Addon  -> Server: MBOT RUN~ENCHANT_TRADE~<botName>~<token>~<spellId>
@@ -372,6 +372,7 @@ The bridge enforces the following input rules before any endpoint is called:
 - Group Roll item links are bounded to 160 characters and must contain a valid item-link marker before execution;
 - Group Roll requests are rate-limited per requester (4 requests per 2-second window in the current implementation), and execution is restricted to bridge-visible bots in the requester's actual party/raid with Playerbots security revalidation.
 - Enchant Trade list/run requests are rate-limited per requester (4 requests per 2-second window), require an exact controllable bot name and token, and accept only a positive numeric spell ID for execution.
+- Enchant Trade list framing declares a per-entry material count and 1-based material indexes; the addon rejects missing, duplicate or out-of-range material frames before caching a list.
 - Enchant Trade execution revalidates Playerbots security, active session/state, Enchanting skill, known active Enchanting spell identity, required tools/reagents, the exact current Trade partner and the requester's `TRADE_SLOT_NONTRADED` item before Core spell preparation.
 
 Malformed bridge requests are consumed and answered with:
