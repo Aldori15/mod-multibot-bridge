@@ -75,12 +75,16 @@ std::size_t constexpr kStrategyMutationRateLimit = 24;
 std::chrono::milliseconds constexpr kStrategyMutationRateWindow(2000);
 std::size_t constexpr kItemActionRateLimit = 24;
 std::chrono::milliseconds constexpr kItemActionRateWindow(2000);
+std::size_t constexpr kGroupRollRateLimit = 4;
+std::chrono::milliseconds constexpr kGroupRollRateWindow(2000);
+std::size_t constexpr kMaxGroupRollItemLinkLength = 160;
 char const* const kStateFramingCapability = "STATE_FRAMING_V1";
 char const* const kStrategyMutationCapability = "STRATEGY_MUTATION_V1";
 char const* const kOutfitCapability = "OUTFIT_V1";
 char const* const kInventoryCapability = "INVENTORY_V1";
 char const* const kInventoryBulkSellCapability = "INVENTORY_BULK_SELL_V1";
 char const* const kInventoryOpenCapability = "INVENTORY_OPEN_V1";
+char const* const kGroupRollCapability = "GROUP_ROLL_V1";
 uint32 constexpr kMaxItemActionCount = 1000;
 
 enum class BridgePayloadStatus
@@ -107,6 +111,7 @@ void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& b
 void RunTrainerLearnCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& trainerEntryValue, std::string const& spellIdValue);
 void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& skillIdValue, std::string const& spellIdValue, std::string const& itemIdValue);
 void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue);
+void RunGroupRollCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& modeValue, std::string const& encodedItemLink);
 void RunFormationCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedFormation);
 void SendFormationPackets(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken);
 void SendBotReputationPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
@@ -4292,6 +4297,122 @@ bool ConsumeItemActionRateLimit(Player* requester)
     return true;
 }
 
+struct GroupRollRateState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+};
+
+std::map<std::string, GroupRollRateState> sGroupRollRateStates;
+
+bool ConsumeGroupRollRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+    GroupRollRateState& state = sGroupRollRateStates[key];
+
+    while (!state.requests.empty() && now - state.requests.front() >= kGroupRollRateWindow)
+        state.requests.pop_front();
+
+    if (state.requests.size() >= kGroupRollRateLimit)
+        return false;
+
+    state.requests.push_back(now);
+
+    if (sGroupRollRateStates.size() > 512)
+    {
+        for (auto it = sGroupRollRateStates.begin(); it != sGroupRollRateStates.end();)
+        {
+            while (!it->second.requests.empty() && now - it->second.requests.front() >= kGroupRollRateWindow)
+                it->second.requests.pop_front();
+
+            if (it->second.requests.empty() && it->first != key)
+                it = sGroupRollRateStates.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    return true;
+}
+
+void RunGroupRollCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& modeValue, std::string const& encodedItemLink)
+{
+    std::string const token = Trim(requestToken);
+    std::string const mode = ToUpper(Trim(modeValue));
+    std::string itemLink;
+    std::string scope = "NONE";
+    std::string reason = "OK";
+    uint32 matched = 0;
+    uint32 invoked = 0;
+
+    if (!requester || !IsValidRequestToken(token) || (mode != "NORMAL" && mode != "ITEM"))
+    {
+        reason = "BAD_REQUEST";
+    }
+    else if (mode == "ITEM" &&
+             (!TryUrlDecodeField(encodedItemLink, itemLink, kMaxGroupRollItemLinkLength, false) ||
+              itemLink.find("|Hitem:") == std::string::npos))
+    {
+        reason = "BAD_ITEM";
+    }
+    else if (mode == "NORMAL" && !encodedItemLink.empty())
+    {
+        reason = "BAD_REQUEST";
+    }
+    else if (!ConsumeGroupRollRateLimit(requester))
+    {
+        reason = "RATE_LIMIT";
+    }
+    else
+    {
+        Group* const group = requester->GetGroup();
+        if (!group)
+        {
+            reason = "NO_GROUP";
+        }
+        else
+        {
+            scope = group->isRaidGroup() ? "RAID" : "PARTY";
+            for (Player* const bot : GetBridgeVisibleBots(requester))
+            {
+                if (!bot || bot->GetGroup() != group)
+                    continue;
+
+                ++matched;
+                PlayerbotAI* const botAI = GetBotAI(bot);
+                if (!botAI || !botAI->GetSecurity() ||
+                    !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+                {
+                    continue;
+                }
+
+                botAI->DoSpecificAction("roll", Event("roll", itemLink, requester), true);
+                ++invoked;
+            }
+
+            if (!matched)
+                reason = "NO_BOTS";
+            else if (!invoked)
+                reason = "FORBIDDEN";
+        }
+    }
+
+    std::string const status = reason == "OK" ? "OK" : "ERR";
+    std::ostringstream payload;
+    payload << token
+        << kFieldSeparator << status
+        << kFieldSeparator << mode
+        << kFieldSeparator << scope
+        << kFieldSeparator << matched
+        << kFieldSeparator << invoked
+        << kFieldSeparator << UrlEncodeField(reason);
+
+    SendAddonPacket(requester, replyType, "GROUP_ROLL_ACK", payload.str());
+}
+
 void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue)
 {
     std::string const trimmedBotName = Trim(botName);
@@ -6266,7 +6387,7 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             player,
             replyType,
             "CAPS",
-            std::string(kStateFramingCapability) + "," + kStrategyMutationCapability + "," + kOutfitCapability + "," + kInventoryCapability + "," + kInventoryBulkSellCapability + "," + kInventoryOpenCapability);
+            std::string(kStateFramingCapability) + "," + kStrategyMutationCapability + "," + kOutfitCapability + "," + kInventoryCapability + "," + kInventoryBulkSellCapability + "," + kInventoryOpenCapability + "," + kGroupRollCapability);
         return true;
     }
 
@@ -6651,6 +6772,45 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         }
 
         RunProfessionRecipeCraftCommand(player, replyType, fields[1], fields[2], fields[3], fields[4], fields[5]);
+        return true;
+    }
+
+    if (requestType == "GROUP_ROLL")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() < 3 || fields.size() > 4)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        std::string const mode = ToUpper(Trim(fields[2]));
+        if (fields[2] != mode || (mode != "NORMAL" && mode != "ITEM"))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_MODE");
+
+        if (mode == "NORMAL")
+        {
+            if (fields.size() != 3)
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+            RunGroupRollCommand(player, replyType, fields[1], fields[2], "");
+            return true;
+        }
+
+        if (fields.size() != 4)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidEncodedField(fields[3], kMaxGroupRollItemLinkLength, false))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_ENCODING");
+
+        std::string itemLink;
+        if (!TryUrlDecodeField(fields[3], itemLink, kMaxGroupRollItemLinkLength, false) ||
+            itemLink.find("|Hitem:") == std::string::npos)
+        {
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_ITEM");
+        }
+
+        RunGroupRollCommand(player, replyType, fields[1], fields[2], fields[3]);
         return true;
     }
 
