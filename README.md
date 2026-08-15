@@ -336,6 +336,15 @@ Addon  -> Server: MBOT RUN~GROUP_ROLL~<token>~NORMAL
 Addon  -> Server: MBOT RUN~GROUP_ROLL~<token>~ITEM~<encodedItemLink>
 Server -> Addon:  MBOT GROUP_ROLL_ACK~<token>~<status>~<mode>~<scope>~<matched>~<invoked>~<reason>
 
+Addon  -> Server: MBOT GET~INVENTORY_EXACT~<botName>~<token>
+Server -> Addon:  MBOT INV_EXACT_BEGIN~<botName>~<token>
+Server -> Addon:  MBOT INV_BAG~<botName>~<token>~<kind>~<bag>~<slotStart>~<slotCount>~<bagItemId>
+Server -> Addon:  MBOT INV_ITEM_LOC~<botName>~<token>~<bag>~<slot>~<itemId>~<count>~<soulbound>
+Server -> Addon:  MBOT INV_EXACT_END~<botName>~<token>
+
+Addon  -> Server: MBOT RUN~ITEM_MOVE~<botName>~<token>~<srcBag>~<srcSlot>~<srcItemId>~<srcCount>~<dstBag>~<dstSlot>~<dstItemId>~<dstCount>
+Server -> Addon:  MBOT INVENTORY_ITEM_MOVE~<botName>~<token>~<status>~<reason>~<srcBag>~<srcSlot>~<dstBag>~<dstSlot>
+
 Addon  -> Server: MBOT GET~ENCHANT_TRADE~<botName>~<token>
 Server -> Addon:  MBOT ENCHANT_TRADE_BEGIN~<botName>~<token>~<status>~<reason>~<skill>~<maxSkill>
 Server -> Addon:  MBOT ENCHANT_TRADE_ITEM~<botName>~<token>~<spellId>~<difficulty>~<available>~<hasTools>~<materialCount>
@@ -346,7 +355,7 @@ Addon  -> Server: MBOT RUN~ENCHANT_TRADE~<botName>~<token>~<spellId>
 Server -> Addon:  MBOT ENCHANT_TRADE_RESULT~<botName>~<token>~<spellId>~<status>~<reason>~<accepted>
 ```
 
-Current capability negotiation includes `STATE_FRAMING_V1`, `STRATEGY_MUTATION_V1`, `OUTFIT_V1`, `INVENTORY_V1`, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1` and `ENCHANT_TRADE_V1`.
+Current capability negotiation includes `STATE_FRAMING_V1`, `STRATEGY_MUTATION_V1`, `OUTFIT_V1`, `INVENTORY_V1`, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1` and `ENCHANT_TRADE_V1`.
 
 The exact payloads are consumed internally by the MultiBot addon.
 
@@ -369,6 +378,10 @@ The bridge enforces the following input rules before any endpoint is called:
 - rejection of control characters;
 - a maximum `ITEM_ACTION` count of 1000, while `0` keeps its existing
   endpoint-specific meaning;
+- `ITEM_MOVE_V1` accepts only exact source/destination coordinates and expected item/count state, with item counts bounded to 1000;
+- `ITEM_MOVE_V1` is rate-limited to 8 requests per requester per 2-second window, rejects replayed request tokens for 10 seconds, keeps at most 32 recent tokens per requester and bounds requester move state to 512 entries;
+- `ITEM_MOVE_V1` revalidates the requester, controllable bot, sessions/world state, Backpack/Bag/Keyring position whitelist and exact source/destination state immediately before execution;
+- `ITEM_MOVE_V1` executes one native `Player::SwapItem` call, rereads both positions and reports success only when the authoritative state actually changed; it does not use `SplitItem`, `HandleCommand`, `DoSpecificAction` or a generic chat executor;
 - Group Roll item links are bounded to 160 characters and must contain a valid item-link marker before execution;
 - Group Roll requests are rate-limited per requester (4 requests per 2-second window in the current implementation), and execution is restricted to bridge-visible bots in the requester's actual party/raid with Playerbots security revalidation.
 - Enchant Trade list/run requests are rate-limited per requester (4 requests per 2-second window), require an exact controllable bot name and token, and accept only a positive numeric spell ID for execution.
@@ -463,7 +476,15 @@ should not be assumed to be generically fragmented by this capability.
   </tr>
   <tr>
     <td><code>GET~INVENTORY</code> / <code>INVENTORY_V1</code></td>
-    <td>Refresh inventory data natively through the bridge with item links and icons.</td>
+    <td>Refresh the established native inventory listing through the bridge with item links and icons.</td>
+  </tr>
+  <tr>
+    <td><code>GET~INVENTORY_EXACT</code> / <code>INVENTORY_EXACT_V1</code></td>
+    <td>Expose the bot's exact physical inventory topology for Backpack, equipped Bag 1..4 and Keyring, including container geometry, empty slots and item positions used by the bag-aware addon UI.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~ITEM_MOVE</code> / <code>ITEM_MOVE_V1</code></td>
+    <td>Move one whole stack between allowed physical inventory positions after strict server-side revalidation, using one native <code>Player::SwapItem</code> call followed by authoritative source/destination rereads and a structured <code>INVENTORY_ITEM_MOVE</code> result.</td>
   </tr>
   <tr>
     <td><code>RUN~ITEM_ACTION</code> — <code>SELL_VENDOR</code> / <code>SELL_GREY</code></td>
@@ -623,16 +644,13 @@ The endpoint and switching implementation remain present, while the project's fi
 
 # Current Development Baseline
 
-Documentation synchronized on **2026-08-14** against:
+Documentation synchronized on **2026-08-15** against the validated bridge-first inventory work.
 
-- addon `main`: `106074c3c93f80812f73af27e746860c7c8a4dcf` (PR #61, Group Roll UI);
-- bridge `main`: `210bd1f4f6597fe4f0691ec729ec4904ebe2d463` (PR #26, Group Roll support).
+Recent bridge-first milestones include `OUTFIT_V1`, `INVENTORY_V1`, hardened bank/guild-bank/vendor-buy item actions, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1`, the runtime-validated `ENCHANT_TRADE_V1` Enchanting Trade Service, `INVENTORY_EXACT_V1` and `ITEM_MOVE_V1`.
 
-Recent bridge-first milestones include `OUTFIT_V1`, `INVENTORY_V1`, hardened bank/guild-bank/vendor-buy item actions, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1` and the runtime-validated `ENCHANT_TRADE_V1` Enchanting Trade Service.
+`INVENTORY_EXACT_V1` exposes exact Backpack, equipped-bag and Keyring topology for the bag-aware addon UI. `ITEM_MOVE_V1` is runtime validated for whole-stack drag/drop and uses native `Player::SwapItem` with strict server-side state revalidation and post-operation verification; no generic Playerbots command/chat executor is exposed. Stack splitting remains a separate future concern.
 
-The current PR candidate adds `ENCHANT_TRADE_V1` on top of the Group Roll main baseline. Runtime validation on 2026-08-14 confirmed known-enchant listing, native Trade-slot execution and a real item enchant with no generic cast/chat executor.
-
-The next normal roadmap item is **item-specific loot-rule add/remove**. Deferred work that must not interrupt that sequence includes the SELL_GREY/core-API follow-up and final Firestone/Spellstone TEMP_ENCHANT revalidation.
+The next normal roadmap item remains **item-specific loot-rule add/remove**. Deferred work that must not interrupt that sequence includes the SELL_GREY/core-API follow-up and final Firestone/Spellstone TEMP_ENCHANT revalidation.
 
 
 ---
