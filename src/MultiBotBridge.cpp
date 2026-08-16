@@ -107,6 +107,11 @@ std::chrono::milliseconds constexpr kInventoryItemSellRateWindow(2000);
 std::chrono::seconds constexpr kInventoryItemSellReplayTtl(10);
 std::size_t constexpr kInventoryItemSellMaxRecentTokens = 32;
 std::size_t constexpr kInventoryItemSellMaxRequesterStates = 512;
+std::size_t constexpr kVendorBuybackRateLimit = 8;
+std::chrono::milliseconds constexpr kVendorBuybackRateWindow(2000);
+std::chrono::seconds constexpr kVendorBuybackReplayTtl(10);
+std::size_t constexpr kVendorBuybackMaxRecentTokens = 32;
+std::size_t constexpr kVendorBuybackMaxRequesterStates = 512;
 std::size_t constexpr kGroupRollRateLimit = 4;
 std::chrono::milliseconds constexpr kGroupRollRateWindow(2000);
 std::size_t constexpr kEnchantTradeRateLimit = 4;
@@ -124,6 +129,7 @@ char const* const kInventoryItemUnequipCapability = "ITEM_UNEQUIP_V1";
 char const* const kInventoryItemDestroyCapability = "ITEM_DESTROY_V1";
 char const* const kInventoryItemUseCapability = "ITEM_USE_V1";
 char const* const kInventoryItemSellCapability = "ITEM_SELL_SINGLE_V1";
+char const* const kVendorBuybackCapability = "VENDOR_BUYBACK_V1";
 char const* const kInventoryBulkSellCapability = "INVENTORY_BULK_SELL_V1";
 char const* const kInventoryOpenCapability = "INVENTORY_OPEN_V1";
 char const* const kGroupRollCapability = "GROUP_ROLL_V1";
@@ -134,6 +140,7 @@ uint32 constexpr kMaxInventoryItemEquipCount = 1000;
 uint32 constexpr kMaxInventoryItemDestroyCount = 1000;
 uint32 constexpr kMaxInventoryItemUseCount = 1000;
 uint32 constexpr kMaxInventoryItemSellCount = 1000;
+uint32 constexpr kMaxVendorBuybackCount = 1000;
 
 enum class BridgePayloadStatus
 {
@@ -2840,6 +2847,90 @@ bool RegisterInventoryItemSellToken(Player* requester, std::string const& token)
     return true;
 }
 // MB_ITEM_SELL_SINGLE_RATE_V1_END
+// MB_VENDOR_BUYBACK_RATE_V1_BEGIN
+struct VendorBuybackRequestState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+    std::deque<std::pair<std::string, std::chrono::steady_clock::time_point>> recentTokens;
+};
+
+std::map<std::string, VendorBuybackRequestState> sVendorBuybackRequestStates;
+
+void PruneVendorBuybackRequestState(VendorBuybackRequestState& state, std::chrono::steady_clock::time_point const now)
+{
+    while (!state.requests.empty() && now - state.requests.front() >= kVendorBuybackRateWindow)
+        state.requests.pop_front();
+    while (!state.recentTokens.empty() && now - state.recentTokens.front().second >= kVendorBuybackReplayTtl)
+        state.recentTokens.pop_front();
+    while (state.recentTokens.size() > kVendorBuybackMaxRecentTokens)
+        state.recentTokens.pop_front();
+}
+
+bool ConsumeVendorBuybackRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+    auto stateIt = sVendorBuybackRequestStates.find(key);
+
+    if (stateIt == sVendorBuybackRequestStates.end())
+    {
+        if (sVendorBuybackRequestStates.size() >= kVendorBuybackMaxRequesterStates)
+        {
+            for (auto it = sVendorBuybackRequestStates.begin(); it != sVendorBuybackRequestStates.end();)
+            {
+                PruneVendorBuybackRequestState(it->second, now);
+                if (it->second.requests.empty() && it->second.recentTokens.empty())
+                    it = sVendorBuybackRequestStates.erase(it);
+                else
+                    ++it;
+            }
+        }
+
+        if (sVendorBuybackRequestStates.size() >= kVendorBuybackMaxRequesterStates)
+            return false;
+
+        stateIt = sVendorBuybackRequestStates.emplace(key, VendorBuybackRequestState()).first;
+    }
+
+    VendorBuybackRequestState& state = stateIt->second;
+    PruneVendorBuybackRequestState(state, now);
+
+    if (state.requests.size() >= kVendorBuybackRateLimit)
+        return false;
+
+    state.requests.push_back(now);
+    return true;
+}
+
+bool RegisterVendorBuybackToken(Player* requester, std::string const& token)
+{
+    if (!requester || token.empty())
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    auto stateIt = sVendorBuybackRequestStates.find(requester->GetName());
+    if (stateIt == sVendorBuybackRequestStates.end())
+        return false;
+
+    VendorBuybackRequestState& state = stateIt->second;
+    PruneVendorBuybackRequestState(state, now);
+
+    for (auto const& entry : state.recentTokens)
+    {
+        if (entry.first == token)
+            return false;
+    }
+
+    state.recentTokens.push_back(std::make_pair(token, now));
+    while (state.recentTokens.size() > kVendorBuybackMaxRecentTokens)
+        state.recentTokens.pop_front();
+    return true;
+}
+// MB_VENDOR_BUYBACK_RATE_V1_END
+
 
 bool IsInventoryItemEquipSourcePositionAllowed(Player* bot, uint8 bag, uint8 slot)
 {
@@ -6008,6 +6099,218 @@ void RunInventoryItemSellCommand(
     SendAddonPacket(requester, replyType, "INVENTORY_ITEM_SELL", payload.str());
 }
 // MB_ITEM_SELL_SINGLE_V1_END
+// MB_VENDOR_BUYBACK_V1_BEGIN
+struct VendorBuybackEntry
+{
+    uint32 slot = 0;
+    uint32 itemId = 0;
+    uint32 count = 0;
+    uint32 price = 0;
+    uint32 timestamp = 0;
+};
+
+void SendVendorBuybackEnd(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& botName,
+    std::string const& requestToken,
+    char const* status,
+    std::string const& reason,
+    uint32 count)
+{
+    std::ostringstream payload;
+    payload << UrlEncodeField(botName)
+        << kFieldSeparator << requestToken
+        << kFieldSeparator << status
+        << kFieldSeparator << UrlEncodeField(reason)
+        << kFieldSeparator << count;
+
+    SendAddonPacket(requester, replyType, "BUYBACK_END", payload.str());
+}
+
+void SendVendorBuybackPackets(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& botName,
+    std::string const& requestToken)
+{
+    std::string const trimmedBotName = Trim(botName);
+    std::string const token = Trim(requestToken);
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+    std::string reason;
+
+    if (!ConsumeVendorBuybackRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else if (!bot)
+        reason = "NO_BOT";
+    else
+    {
+        PlayerbotAI* const botAI = GetBotAI(bot);
+        if (!botAI || !botAI->GetSecurity() ||
+            !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+            reason = "FORBIDDEN";
+        else if (!requester || !requester->GetSession())
+            reason = "NO_REQUESTER_SESSION";
+        else if (!bot->GetSession())
+            reason = "NO_BOT_SESSION";
+        else if (!bot->IsInWorld())
+            reason = "BOT_NOT_IN_WORLD";
+        else if (!bot->IsAlive())
+            reason = "BOT_DEAD";
+        else if (!FindNearbyInteractiveVendor(bot))
+            reason = "VENDOR_NOT_FOUND";
+    }
+
+    if (!reason.empty())
+    {
+        SendVendorBuybackEnd(requester, replyType, effectiveBotName, token, "ERR", reason, 0);
+        return;
+    }
+
+    std::vector<VendorBuybackEntry> entries;
+    entries.reserve(BUYBACK_SLOT_END - BUYBACK_SLOT_START);
+
+    for (uint32 slot = BUYBACK_SLOT_START; slot < BUYBACK_SLOT_END; ++slot)
+    {
+        Item* const item = bot->GetItemFromBuyBackSlot(slot);
+        if (!item)
+            continue;
+
+        VendorBuybackEntry entry;
+        entry.slot = slot;
+        entry.itemId = item->GetEntry();
+        entry.count = item->GetCount();
+        entry.price = bot->GetUInt32Value(PLAYER_FIELD_BUYBACK_PRICE_1 + slot - BUYBACK_SLOT_START);
+        entry.timestamp = bot->GetUInt32Value(PLAYER_FIELD_BUYBACK_TIMESTAMP_1 + slot - BUYBACK_SLOT_START);
+        entries.push_back(entry);
+    }
+
+    std::ostringstream beginPayload;
+    beginPayload << UrlEncodeField(effectiveBotName)
+        << kFieldSeparator << token
+        << kFieldSeparator << entries.size();
+    SendAddonPacket(requester, replyType, "BUYBACK_BEGIN", beginPayload.str());
+
+    for (VendorBuybackEntry const& entry : entries)
+    {
+        std::ostringstream itemPayload;
+        itemPayload << UrlEncodeField(effectiveBotName)
+            << kFieldSeparator << token
+            << kFieldSeparator << entry.slot
+            << kFieldSeparator << entry.itemId
+            << kFieldSeparator << entry.count
+            << kFieldSeparator << entry.price
+            << kFieldSeparator << entry.timestamp;
+        SendAddonPacket(requester, replyType, "BUYBACK_ITEM", itemPayload.str());
+    }
+
+    SendVendorBuybackEnd(
+        requester, replyType, effectiveBotName, token, "OK", "OK", static_cast<uint32>(entries.size()));
+}
+
+void RunVendorBuybackCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& botName,
+    std::string const& requestToken,
+    uint32 slot,
+    uint32 expectedItemId,
+    uint32 expectedCount,
+    uint32 expectedPrice)
+{
+    std::string const trimmedBotName = Trim(botName);
+    std::string const token = Trim(requestToken);
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+    std::string reason;
+    bool purchased = false;
+
+    if (!ConsumeVendorBuybackRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else if (!bot)
+        reason = "NO_BOT";
+    else
+    {
+        PlayerbotAI* const botAI = GetBotAI(bot);
+        if (!botAI || !botAI->GetSecurity() ||
+            !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+            reason = "FORBIDDEN";
+        else if (!RegisterVendorBuybackToken(requester, token))
+            reason = "DUPLICATE";
+        else if (!requester || !requester->GetSession())
+            reason = "NO_REQUESTER_SESSION";
+        else if (!bot->GetSession())
+            reason = "NO_BOT_SESSION";
+        else if (!bot->IsInWorld())
+            reason = "BOT_NOT_IN_WORLD";
+        else if (!bot->IsAlive())
+            reason = "BOT_DEAD";
+        else if (slot < BUYBACK_SLOT_START || slot >= BUYBACK_SLOT_END)
+            reason = "BAD_SLOT";
+        else
+        {
+            Item* const sourceItem = bot->GetItemFromBuyBackSlot(slot);
+            uint32 const actualPrice = bot->GetUInt32Value(
+                PLAYER_FIELD_BUYBACK_PRICE_1 + slot - BUYBACK_SLOT_START);
+
+            if (!sourceItem ||
+                sourceItem->GetEntry() != expectedItemId ||
+                sourceItem->GetCount() != expectedCount ||
+                actualPrice != expectedPrice)
+            {
+                reason = "SOURCE_STALE";
+            }
+            else
+            {
+                Creature* const vendor = FindNearbyInteractiveVendor(bot);
+                if (!vendor)
+                    reason = "VENDOR_NOT_FOUND";
+                else if (!bot->HasEnoughMoney(actualPrice))
+                    reason = "NOT_ENOUGH_MONEY";
+                else
+                {
+                    ItemPosCountVec destination;
+                    InventoryResult const canStore =
+                        bot->CanStoreItem(NULL_BAG, NULL_SLOT, destination, sourceItem, false);
+                    if (canStore != EQUIP_ERR_OK)
+                    {
+                        reason = "CANNOT_STORE";
+                    }
+                    else
+                    {
+                        WorldPacket packet(CMSG_BUYBACK_ITEM);
+                        packet << vendor->GetGUID() << slot;
+
+                        WorldPackets::Item::BuybackItem buybackPacket(std::move(packet));
+                        buybackPacket.Read();
+                        bot->GetSession()->HandleBuybackItem(buybackPacket);
+
+                        purchased = bot->GetItemFromBuyBackSlot(slot) == nullptr;
+                        reason = purchased ? "OK" : "FAILED";
+                    }
+                }
+            }
+        }
+    }
+
+    if (reason.empty())
+        reason = "FAILED";
+
+    std::ostringstream payload;
+    payload << UrlEncodeField(effectiveBotName)
+        << kFieldSeparator << token
+        << kFieldSeparator << (purchased ? "OK" : "ERR")
+        << kFieldSeparator << UrlEncodeField(reason)
+        << kFieldSeparator << slot
+        << kFieldSeparator << expectedItemId
+        << kFieldSeparator << expectedCount
+        << kFieldSeparator << expectedPrice;
+
+    SendAddonPacket(requester, replyType, "BUYBACK_RESULT", payload.str());
+}
+// MB_VENDOR_BUYBACK_V1_END
+
 
 void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue)
 {
@@ -8184,7 +8487,7 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             player,
             replyType,
             "CAPS",
-            std::string(kStateFramingCapability) + "," + kStrategyMutationCapability + "," + kOutfitCapability + "," + kInventoryCapability + "," + kInventoryExactCapability + "," + kInventoryItemMoveCapability + "," + kInventoryItemEquipCapability + "," + kInventoryItemUnequipCapability + "," + kInventoryItemDestroyCapability + "," + kInventoryItemUseCapability + "," + kInventoryItemSellCapability + "," + kInventoryBulkSellCapability + "," + kInventoryOpenCapability + "," + kGroupRollCapability + "," + kEnchantTradeCapability);
+            std::string(kStateFramingCapability) + "," + kStrategyMutationCapability + "," + kOutfitCapability + "," + kInventoryCapability + "," + kInventoryExactCapability + "," + kInventoryItemMoveCapability + "," + kInventoryItemEquipCapability + "," + kInventoryItemUnequipCapability + "," + kInventoryItemDestroyCapability + "," + kInventoryItemUseCapability + "," + kInventoryItemSellCapability + "," + kVendorBuybackCapability + "," + kInventoryBulkSellCapability + "," + kInventoryOpenCapability + "," + kGroupRollCapability + "," + kEnchantTradeCapability);
         return true;
     }
 
@@ -8441,7 +8744,7 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             return true;
         }
 
-        if (requestType == "INVENTORY" || requestType == "INVENTORY_EXACT" || requestType == "BANK" || requestType == "GBANK" ||
+        if (requestType == "INVENTORY" || requestType == "INVENTORY_EXACT" || requestType == "BUYBACK" || requestType == "BANK" || requestType == "GBANK" ||
             requestType == "SPELLBOOK" || requestType == "BOT_SKILLS" || requestType == "BOT_REPUTATIONS" ||
             requestType == "BOT_EMBLEMS" || requestType == "OUTFITS" || requestType == "TRAINER")
         {
@@ -8463,6 +8766,8 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
                     return SendProtocolError(player, replyType, normalized, requestType, fields[2], "RATE_LIMIT");
                 SendInventoryExactSnapshot(player, replyType, fields[1], fields[2]);
             }
+            else if (requestType == "BUYBACK")
+                SendVendorBuybackPackets(player, replyType, fields[1], fields[2]);
             else if (requestType == "BANK")
                 SendBankPackets(player, replyType, fields[1], fields[2]);
             else if (requestType == "GBANK")
@@ -8764,6 +9069,34 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         RunInventoryItemUseCommand(
             player, replyType, fields[1], fields[2],
             static_cast<uint8>(srcBag), static_cast<uint8>(srcSlot), srcItemId, srcCount);
+        return true;
+    }
+
+    if (requestType == "BUYBACK_ITEM")
+    {
+        std::string const token = GetSafeErrorToken(fields, 2);
+        if (fields.size() != 7)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidCanonicalRawField(fields[1], kMaxBotNameLength, false))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+
+        if (!IsValidRequestToken(fields[2]))
+            return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        uint32 slot = 0;
+        uint32 itemId = 0;
+        uint32 count = 0;
+        uint32 price = 0;
+        if (!TryParseUint32Field(fields[3], BUYBACK_SLOT_START, BUYBACK_SLOT_END - 1, slot) ||
+            !TryParseUint32Field(fields[4], 1, std::numeric_limits<uint32>::max(), itemId) ||
+            !TryParseUint32Field(fields[5], 1, kMaxVendorBuybackCount, count) ||
+            !TryParseUint32Field(fields[6], 0, std::numeric_limits<uint32>::max(), price))
+        {
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_NUMBER");
+        }
+
+        RunVendorBuybackCommand(player, replyType, fields[1], fields[2], slot, itemId, count, price);
         return true;
     }
 
