@@ -345,6 +345,12 @@ Server -> Addon:  MBOT INV_EXACT_END~<botName>~<token>
 Addon  -> Server: MBOT RUN~ITEM_MOVE~<botName>~<token>~<srcBag>~<srcSlot>~<srcItemId>~<srcCount>~<dstBag>~<dstSlot>~<dstItemId>~<dstCount>
 Server -> Addon:  MBOT INVENTORY_ITEM_MOVE~<botName>~<token>~<status>~<reason>~<srcBag>~<srcSlot>~<dstBag>~<dstSlot>
 
+Addon  -> Server: MBOT RUN~ITEM_EQUIP~<botName>~<token>~<srcBag>~<srcSlot>~<srcItemId>~<srcCount>
+Server -> Addon:  MBOT INVENTORY_ITEM_EQUIP~<botName>~<token>~<status>~<reason>~<srcBag>~<srcSlot>~<dstSlot>
+
+Addon  -> Server: MBOT RUN~ITEM_UNEQUIP~<botName>~<token>~<srcSlot>~<srcItemId>
+Server -> Addon:  MBOT INVENTORY_ITEM_UNEQUIP~<botName>~<token>~<status>~<reason>~<srcSlot>~<srcItemId>
+
 Addon  -> Server: MBOT GET~ENCHANT_TRADE~<botName>~<token>
 Server -> Addon:  MBOT ENCHANT_TRADE_BEGIN~<botName>~<token>~<status>~<reason>~<skill>~<maxSkill>
 Server -> Addon:  MBOT ENCHANT_TRADE_ITEM~<botName>~<token>~<spellId>~<difficulty>~<available>~<hasTools>~<materialCount>
@@ -355,7 +361,7 @@ Addon  -> Server: MBOT RUN~ENCHANT_TRADE~<botName>~<token>~<spellId>
 Server -> Addon:  MBOT ENCHANT_TRADE_RESULT~<botName>~<token>~<spellId>~<status>~<reason>~<accepted>
 ```
 
-Current capability negotiation includes `STATE_FRAMING_V1`, `STRATEGY_MUTATION_V1`, `OUTFIT_V1`, `INVENTORY_V1`, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1` and `ENCHANT_TRADE_V1`.
+Current capability negotiation includes `STATE_FRAMING_V1`, `STRATEGY_MUTATION_V1`, `OUTFIT_V1`, `INVENTORY_V1`, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1` and `ENCHANT_TRADE_V1`.
 
 The exact payloads are consumed internally by the MultiBot addon.
 
@@ -382,6 +388,10 @@ The bridge enforces the following input rules before any endpoint is called:
 - `ITEM_MOVE_V1` is rate-limited to 8 requests per requester per 2-second window, rejects replayed request tokens for 10 seconds, keeps at most 32 recent tokens per requester and bounds requester move state to 512 entries;
 - `ITEM_MOVE_V1` revalidates the requester, controllable bot, sessions/world state, Backpack/Bag/Keyring position whitelist and exact source/destination state immediately before execution;
 - `ITEM_MOVE_V1` executes one native `Player::SwapItem` call, rereads both positions and reports success only when the authoritative state actually changed; it does not use `SplitItem`, `HandleCommand`, `DoSpecificAction` or a generic chat executor;
+- `ITEM_EQUIP_V1` accepts only an exact Backpack/Bag 1..4 source identity (`bag`, `slot`, `itemId`, `count`), applies the same bounded requester protections as the exact inventory mutation family, invokes the native AzerothCore auto-equip path and reports success only after authoritative postcondition validation;
+- `ITEM_UNEQUIP_V1` accepts only an exact equipment slot `0..18` plus positive `itemId`, revalidates Playerbots security, requester/bot sessions, world/alive state and source identity, and captures the source GUID before execution;
+- `ITEM_UNEQUIP_V1` is rate-limited to 8 requests per requester per 2-second window, rejects replayed tokens for 10 seconds, keeps at most 32 recent tokens per requester and bounds requester unequip state to 512 entries;
+- `ITEM_UNEQUIP_V1` uses `CMSG_AUTOSTORE_BAG_ITEM` through the native AzerothCore session handler and reports success only when the same GUID is found outside equipment in an allowed Backpack/Bag 1..4 position; it does not call Playerbots `UnequipAction`, `HandleCommand`, `DoSpecificAction` or a generic chat executor;
 - Group Roll item links are bounded to 160 characters and must contain a valid item-link marker before execution;
 - Group Roll requests are rate-limited per requester (4 requests per 2-second window in the current implementation), and execution is restricted to bridge-visible bots in the requester's actual party/raid with Playerbots security revalidation.
 - Enchant Trade list/run requests are rate-limited per requester (4 requests per 2-second window), require an exact controllable bot name and token, and accept only a positive numeric spell ID for execution.
@@ -485,6 +495,14 @@ should not be assumed to be generically fragmented by this capability.
   <tr>
     <td><code>RUN~ITEM_MOVE</code> / <code>ITEM_MOVE_V1</code></td>
     <td>Move one whole stack between allowed physical inventory positions after strict server-side revalidation, using one native <code>Player::SwapItem</code> call followed by authoritative source/destination rereads and a structured <code>INVENTORY_ITEM_MOVE</code> result.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~ITEM_EQUIP</code> / <code>ITEM_EQUIP_V1</code></td>
+    <td>Equip one exact item from Backpack or equipped Bag 1..4 after server-side source identity and runtime revalidation, using the native AzerothCore auto-equip path and a structured <code>INVENTORY_ITEM_EQUIP</code> result.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~ITEM_UNEQUIP</code> / <code>ITEM_UNEQUIP_V1</code></td>
+    <td>Unequip one exact equipment slot/item identity through the native AzerothCore auto-store path, validate the same item GUID in an allowed inventory position after execution and return a structured <code>INVENTORY_ITEM_UNEQUIP</code> result.</td>
   </tr>
   <tr>
     <td><code>RUN~ITEM_ACTION</code> — <code>SELL_VENDOR</code> / <code>SELL_GREY</code></td>
