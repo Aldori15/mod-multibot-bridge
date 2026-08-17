@@ -340,6 +340,7 @@ Addon  -> Server: MBOT GET~INVENTORY_EXACT~<botName>~<token>
 Server -> Addon:  MBOT INV_EXACT_BEGIN~<botName>~<token>
 Server -> Addon:  MBOT INV_BAG~<botName>~<token>~<kind>~<bag>~<slotStart>~<slotCount>~<bagItemId>
 Server -> Addon:  MBOT INV_ITEM_LOC~<botName>~<token>~<bag>~<slot>~<itemId>~<count>~<soulbound>
+Server -> Addon:  MBOT INV_EXACT_ERROR~<botName>~<token>~<reason>  (failure only)
 Server -> Addon:  MBOT INV_EXACT_END~<botName>~<token>
 
 Addon  -> Server: MBOT RUN~ITEM_MOVE~<botName>~<token>~<srcBag>~<srcSlot>~<srcItemId>~<srcCount>~<dstBag>~<dstSlot>~<dstItemId>~<dstCount>
@@ -361,7 +362,7 @@ Addon  -> Server: MBOT RUN~ENCHANT_TRADE~<botName>~<token>~<spellId>
 Server -> Addon:  MBOT ENCHANT_TRADE_RESULT~<botName>~<token>~<spellId>~<status>~<reason>~<accepted>
 ```
 
-Current capability negotiation includes `STATE_FRAMING_V1`, `STRATEGY_MUTATION_V1`, `OUTFIT_V1`, `INVENTORY_V1`, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_USE_V1`, `ITEM_SELL_SINGLE_V1`, `VENDOR_BUYBACK_V1`, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1` and `ENCHANT_TRADE_V1`.
+Current capability negotiation includes `STATE_FRAMING_V1`, `STRATEGY_MUTATION_V1`, `OUTFIT_V1`, `INVENTORY_V1`, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_DESTROY_V1`, `ITEM_USE_V1`, `ITEM_SELL_SINGLE_V1`, `VENDOR_BUYBACK_V1`, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1` and `ENCHANT_TRADE_V1`.
 
 The exact payloads are consumed internally by the MultiBot addon.
 
@@ -509,7 +510,7 @@ should not be assumed to be generically fragmented by this capability.
     <td>Use one item from an exact physical inventory source after server-side identity/runtime revalidation, execute through the native use-item handler and return a structured <code>INVENTORY_ITEM_USE</code> result.</td>
   </tr>
   <tr>
-    <td><code>RUN~ITEM_DESTROY</code> / <code>ITEM_DESTROY</code></td>
+    <td><code>RUN~ITEM_DESTROY</code> / <code>ITEM_DESTROY_V1</code></td>
     <td>Destroy one exact item through a specialized endpoint after server-side source identity and runtime revalidation; no generic Playerbots command executor is used.</td>
   </tr>
   <tr>

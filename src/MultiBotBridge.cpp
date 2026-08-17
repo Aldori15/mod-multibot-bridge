@@ -3103,7 +3103,16 @@ void SendInventoryExactSnapshot(Player* requester, ChatMsg replyType, std::strin
     PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
     if (!botAI || !botAI->GetSecurity() ||
         !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+    {
+        SendAddonPacket(requester, replyType, "INV_EXACT_BEGIN", prefixPayload);
+        SendAddonPacket(
+            requester,
+            replyType,
+            "INV_EXACT_ERROR",
+            prefixPayload + std::string(1, kFieldSeparator) + "FORBIDDEN");
+        SendAddonPacket(requester, replyType, "INV_EXACT_END", prefixPayload);
         return;
+    }
 
     SendAddonPacket(requester, replyType, "INV_EXACT_BEGIN", prefixPayload);
 
@@ -6028,7 +6037,8 @@ void RunInventoryItemUseCommand(
                         uint32 spellId = 0;
                         for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
                         {
-                            if (itemTemplate->Spells[i].SpellId > 0)
+                            if (itemTemplate->Spells[i].SpellId > 0 &&
+                                itemTemplate->Spells[i].SpellTrigger == ITEM_SPELLTRIGGER_ON_USE)
                             {
                                 spellId = itemTemplate->Spells[i].SpellId;
                                 break;
@@ -6059,15 +6069,23 @@ void RunInventoryItemUseCommand(
                                 }
                                 else
                                 {
+                                    ObjectGuid const sourceGuid = sourceItem->GetGUID();
+                                    uint32 const beforeCount = sourceItem->GetCount();
+                                    bool const hadCooldown = bot->HasSpellCooldown(spellId);
+
                                     WorldPacket packet(CMSG_USE_ITEM);
                                     packet << srcBag << srcSlot << uint8(1) << spellId
-                                           << sourceItem->GetGUID() << uint32(0) << uint8(0);
+                                           << sourceGuid << uint32(0) << uint8(0);
                                     packet << uint32(TARGET_FLAG_NONE);
                                     packet << bot->GetPackGUID();
                                     bot->GetSession()->HandleUseItemOpcode(packet);
 
-                                    used = true;
-                                    reason = "OK";
+                                    Item* const sourceAfter = bot->GetItemByGuid(sourceGuid);
+                                    bool const consumed = !sourceAfter || sourceAfter->GetCount() < beforeCount;
+                                    bool const cooldownStarted = !hadCooldown && bot->HasSpellCooldown(spellId);
+                                    bool const castStarted = bot->IsNonMeleeSpellCast(false);
+                                    used = consumed || cooldownStarted || castStarted;
+                                    reason = used ? "OK" : "CAST_FAILED";
                                 }
                             }
                         }
