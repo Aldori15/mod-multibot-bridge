@@ -8893,7 +8893,17 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             else if (requestType == "INVENTORY_EXACT")
             {
                 if (!ConsumeInventoryExactRateLimit(player))
-                    return SendProtocolError(player, replyType, normalized, requestType, fields[2], "RATE_LIMIT");
+                {
+                    std::string const prefixPayload = fields[1] + std::string(1, kFieldSeparator) + fields[2];
+                    SendAddonPacket(player, replyType, "INV_EXACT_BEGIN", prefixPayload);
+                    SendAddonPacket(
+                        player,
+                        replyType,
+                        "INV_EXACT_ERROR",
+                        prefixPayload + std::string(1, kFieldSeparator) + "RATE_LIMIT");
+                    SendAddonPacket(player, replyType, "INV_EXACT_END", prefixPayload);
+                    return true;
+                }
                 SendInventoryExactSnapshot(player, replyType, fields[1], fields[2]);
             }
             else if (requestType == "BUYBACK")
