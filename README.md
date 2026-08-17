@@ -361,7 +361,7 @@ Addon  -> Server: MBOT RUN~ENCHANT_TRADE~<botName>~<token>~<spellId>
 Server -> Addon:  MBOT ENCHANT_TRADE_RESULT~<botName>~<token>~<spellId>~<status>~<reason>~<accepted>
 ```
 
-Current capability negotiation includes `STATE_FRAMING_V1`, `STRATEGY_MUTATION_V1`, `OUTFIT_V1`, `INVENTORY_V1`, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1` and `ENCHANT_TRADE_V1`.
+Current capability negotiation includes `STATE_FRAMING_V1`, `STRATEGY_MUTATION_V1`, `OUTFIT_V1`, `INVENTORY_V1`, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_USE_V1`, `ITEM_SELL_SINGLE_V1`, `VENDOR_BUYBACK_V1`, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1` and `ENCHANT_TRADE_V1`.
 
 The exact payloads are consumed internally by the MultiBot addon.
 
@@ -503,6 +503,22 @@ should not be assumed to be generically fragmented by this capability.
   <tr>
     <td><code>RUN~ITEM_UNEQUIP</code> / <code>ITEM_UNEQUIP_V1</code></td>
     <td>Unequip one exact equipment slot/item identity through the native AzerothCore auto-store path, validate the same item GUID in an allowed inventory position after execution and return a structured <code>INVENTORY_ITEM_UNEQUIP</code> result.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~ITEM_USE</code> / <code>ITEM_USE_V1</code></td>
+    <td>Use one item from an exact physical inventory source after server-side identity/runtime revalidation, execute through the native use-item handler and return a structured <code>INVENTORY_ITEM_USE</code> result.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~ITEM_DESTROY</code> / <code>ITEM_DESTROY</code></td>
+    <td>Destroy one exact item through a specialized endpoint after server-side source identity and runtime revalidation; no generic Playerbots command executor is used.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~ITEM_SELL</code> / <code>ITEM_SELL_SINGLE_V1</code></td>
+    <td>Sell one exact item after revalidating source identity, nearby vendor interaction and protected-item rules, then return a structured <code>INVENTORY_ITEM_SELL</code> result.</td>
+  </tr>
+  <tr>
+    <td><code>VENDOR_BUYBACK_V1</code></td>
+    <td>Expose Buyback through structured <code>BUYBACK_BEGIN</code>/<code>BUYBACK_ITEM</code>/<code>BUYBACK_END</code>/<code>BUYBACK_RESULT</code> messages, bounded nearby-vendor validation and the native Buyback handler.</td>
   </tr>
   <tr>
     <td><code>RUN~ITEM_ACTION</code> — <code>SELL_VENDOR</code> / <code>SELL_GREY</code></td>
@@ -662,11 +678,11 @@ The endpoint and switching implementation remain present, while the project's fi
 
 # Current Development Baseline
 
-Documentation synchronized on **2026-08-15** against the validated bridge-first inventory work.
+Documentation synchronized on **2026-08-17** against the validated Jellypowered bridge-first inventory work and pre-merge stabilization state.
 
-Recent bridge-first milestones include `OUTFIT_V1`, `INVENTORY_V1`, hardened bank/guild-bank/vendor-buy item actions, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1`, the runtime-validated `ENCHANT_TRADE_V1` Enchanting Trade Service, `INVENTORY_EXACT_V1` and `ITEM_MOVE_V1`.
+Recent bridge-first milestones include `OUTFIT_V1`, `INVENTORY_V1`, hardened bank/guild-bank/vendor-buy item actions, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1`, the runtime-validated `ENCHANT_TRADE_V1` Enchanting Trade Service, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_USE_V1`, the specialized `ITEM_DESTROY` path, `ITEM_SELL_SINGLE_V1` and `VENDOR_BUYBACK_V1`.
 
-`INVENTORY_EXACT_V1` exposes exact Backpack, equipped-bag and Keyring topology for the bag-aware addon UI. `ITEM_MOVE_V1` is runtime validated for whole-stack drag/drop and uses native `Player::SwapItem` with strict server-side state revalidation and post-operation verification; no generic Playerbots command/chat executor is exposed. Stack splitting remains a separate future concern.
+`INVENTORY_EXACT_V1` exposes exact Backpack, equipped-bag and Keyring topology for the bag-aware addon UI. Exact move/equip/unequip/use/single-sell and Buyback flows revalidate server-side state and wait for structured authoritative results; no generic Playerbots command/chat executor is exposed. Pre-merge stabilization has also closed CAPS wire-budget handling, whole-stack move and quest-start use postconditions, explicit INVENTORY_EXACT authorization, Equip fallback gating, inventory frame recycling, cold-cache safety, ITEM_USE/Inspect localization, the Buyback nil-frame guard and the unused `BUYBACK_ROWS` LuaLint warning. Global LuaLint/CI checks still remain to be executed before merge.
 
 The next normal roadmap item remains **item-specific loot-rule add/remove**. Deferred work that must not interrupt that sequence includes the SELL_GREY/core-API follow-up and final Firestone/Spellstone TEMP_ENCHANT revalidation.
 

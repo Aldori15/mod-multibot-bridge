@@ -212,6 +212,57 @@ bool IsAddonPacketWithinBudget(std::string const& opcode, std::string const& pay
     return GetAddonWireLength(opcode, payload) <= kMaxBridgeWireLength;
 }
 
+bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
+{
+    char const* const capabilities[] =
+    {
+        kStateFramingCapability,
+        kStrategyMutationCapability,
+        kOutfitCapability,
+        kInventoryCapability,
+        kInventoryExactCapability,
+        kInventoryItemMoveCapability,
+        kInventoryItemEquipCapability,
+        kInventoryItemUnequipCapability,
+        kInventoryItemDestroyCapability,
+        kInventoryItemUseCapability,
+        kInventoryItemSellCapability,
+        kVendorBuybackCapability,
+        kInventoryBulkSellCapability,
+        kInventoryOpenCapability,
+        kGroupRollCapability,
+        kEnchantTradeCapability
+    };
+
+    std::vector<std::string> chunks;
+    std::string chunk;
+
+    for (char const* const capability : capabilities)
+    {
+        std::string const candidate = chunk.empty() ? std::string(capability) : chunk + "," + capability;
+        if (IsAddonPacketWithinBudget("CAPS", candidate))
+        {
+            chunk = candidate;
+            continue;
+        }
+
+        if (chunk.empty() || !IsAddonPacketWithinBudget("CAPS", capability))
+            return false;
+
+        chunks.push_back(chunk);
+        chunk = capability;
+    }
+
+    if (!chunk.empty())
+        chunks.push_back(chunk);
+
+    SendAddonPacket(player, chatType, "CAPS_BEGIN");
+    for (std::string const& capabilityChunk : chunks)
+        SendAddonPacket(player, chatType, "CAPS", capabilityChunk);
+    SendAddonPacket(player, chatType, "CAPS_END");
+    return true;
+}
+
 std::pair<std::string, std::string> SplitOnce(std::string const& value, char separator)
 {
     size_t const pos = value.find(separator);
@@ -3041,13 +3092,20 @@ void SendInventoryExactSnapshot(Player* requester, ChatMsg replyType, std::strin
     Player* const bot = FindBotByName(requester, trimmedBotName);
 
     std::string const prefixPayload = trimmedBotName + std::string(1, kFieldSeparator) + requestToken;
-    SendAddonPacket(requester, replyType, "INV_EXACT_BEGIN", prefixPayload);
 
     if (!bot)
     {
+        SendAddonPacket(requester, replyType, "INV_EXACT_BEGIN", prefixPayload);
         SendAddonPacket(requester, replyType, "INV_EXACT_END", prefixPayload);
         return;
     }
+
+    PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+        return;
+
+    SendAddonPacket(requester, replyType, "INV_EXACT_BEGIN", prefixPayload);
 
     SendInventoryExactBagPacket(
         requester,
@@ -3087,29 +3145,25 @@ void SendInventoryExactSnapshot(Player* requester, ChatMsg replyType, std::strin
         bot->GetMaxKeyringSize(),
         0);
 
-    PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
-    if (botAI)
+    std::vector<Item*> const items = botAI->GetInventoryItems();
+    for (Item* const item : items)
     {
-        std::vector<Item*> const items = botAI->GetInventoryItems();
-        for (Item* const item : items)
-        {
-            if (!item)
-                continue;
+        if (!item)
+            continue;
 
-            ItemTemplate const* const proto = item->GetTemplate();
-            if (!proto)
-                continue;
+        ItemTemplate const* const proto = item->GetTemplate();
+        if (!proto)
+            continue;
 
-            std::ostringstream payload;
-            payload << bot->GetName()
-                    << kFieldSeparator << requestToken
-                    << kFieldSeparator << static_cast<uint32>(item->GetBagSlot())
-                    << kFieldSeparator << static_cast<uint32>(item->GetSlot())
-                    << kFieldSeparator << proto->ItemId
-                    << kFieldSeparator << item->GetCount()
-                    << kFieldSeparator << (item->IsSoulBound() ? 1 : 0);
-            SendAddonPacket(requester, replyType, "INV_ITEM_LOC", payload.str());
-        }
+        std::ostringstream payload;
+        payload << bot->GetName()
+                << kFieldSeparator << requestToken
+                << kFieldSeparator << static_cast<uint32>(item->GetBagSlot())
+                << kFieldSeparator << static_cast<uint32>(item->GetSlot())
+                << kFieldSeparator << proto->ItemId
+                << kFieldSeparator << item->GetCount()
+                << kFieldSeparator << (item->IsSoulBound() ? 1 : 0);
+        SendAddonPacket(requester, replyType, "INV_ITEM_LOC", payload.str());
     }
 
     SendAddonPacket(requester, replyType, "INV_EXACT_END", bot->GetName() + std::string(1, kFieldSeparator) + requestToken);
@@ -5518,15 +5572,71 @@ void RunInventoryItemMoveCommand(
                 reason = "DEST_STALE";
             else
             {
-                uint16 const sourcePosition = (static_cast<uint16>(srcBag) << 8) | srcSlot;
-                uint16 const destinationPosition = (static_cast<uint16>(dstBag) << 8) | dstSlot;
-                bot->SwapItem(sourcePosition, destinationPosition);
+                Item* const sourceItem = bot->GetItemByPos(srcBag, srcSlot);
+                Item* const destinationItem = bot->GetItemByPos(dstBag, dstSlot);
+                bool mergeExpected = false;
+                uint32 mergedCount = 0;
 
-                InventoryItemMovePositionState const afterSource = ReadInventoryItemMovePositionState(bot, srcBag, srcSlot);
-                InventoryItemMovePositionState const afterDestination = ReadInventoryItemMovePositionState(bot, dstBag, dstSlot);
-                changed = !InventoryItemMoveStatesEqual(beforeSource, afterSource) ||
-                    !InventoryItemMoveStatesEqual(beforeDestination, afterDestination);
-                reason = changed ? "OK" : "NO_CHANGE";
+                if (!sourceItem)
+                    reason = "SOURCE_STALE";
+                else
+                {
+                    if (destinationItem && !sourceItem->IsBag() && !destinationItem->IsBag())
+                    {
+                        ItemPosCountVec mergeDestination;
+                        InventoryResult const mergeResult =
+                            bot->CanStoreItem(dstBag, dstSlot, mergeDestination, sourceItem, false);
+                        if (mergeResult == EQUIP_ERR_OK)
+                        {
+                            uint64 const combinedCount = static_cast<uint64>(beforeSource.count) +
+                                static_cast<uint64>(beforeDestination.count);
+                            uint32 const maxStackCount = sourceItem->GetMaxStackCount();
+                            if (combinedCount > static_cast<uint64>(maxStackCount))
+                                reason = "PARTIAL_STACK_UNSUPPORTED";
+                            else
+                            {
+                                mergeExpected = true;
+                                mergedCount = static_cast<uint32>(combinedCount);
+                            }
+                        }
+                    }
+
+                    if (reason.empty())
+                    {
+                        uint16 const sourcePosition = (static_cast<uint16>(srcBag) << 8) | srcSlot;
+                        uint16 const destinationPosition = (static_cast<uint16>(dstBag) << 8) | dstSlot;
+                        bot->SwapItem(sourcePosition, destinationPosition);
+
+                        InventoryItemMovePositionState const afterSource =
+                            ReadInventoryItemMovePositionState(bot, srcBag, srcSlot);
+                        InventoryItemMovePositionState const afterDestination =
+                            ReadInventoryItemMovePositionState(bot, dstBag, dstSlot);
+
+                        bool postconditionSatisfied = false;
+                        if (!beforeDestination.present)
+                        {
+                            postconditionSatisfied =
+                                InventoryItemMoveStateMatchesExpected(afterSource, 0, 0) &&
+                                InventoryItemMoveStatesEqual(afterDestination, beforeSource);
+                        }
+                        else if (mergeExpected)
+                        {
+                            postconditionSatisfied =
+                                InventoryItemMoveStateMatchesExpected(afterSource, 0, 0) &&
+                                InventoryItemMoveStateMatchesExpected(
+                                    afterDestination, beforeSource.itemId, mergedCount);
+                        }
+                        else
+                        {
+                            postconditionSatisfied =
+                                InventoryItemMoveStatesEqual(afterSource, beforeDestination) &&
+                                InventoryItemMoveStatesEqual(afterDestination, beforeSource);
+                        }
+
+                        changed = postconditionSatisfied;
+                        reason = changed ? "OK" : "POSTCONDITION_FAILED";
+                    }
+                }
             }
         }
     }
@@ -5900,13 +6010,18 @@ void RunInventoryItemUseCommand(
                         reason = "TARGET_REQUIRED";
                     else if (itemTemplate->StartQuest && sObjectMgr->GetQuestTemplate(itemTemplate->StartQuest))
                     {
+                        uint32 const questId = itemTemplate->StartQuest;
+                        QuestStatus const beforeStatus = bot->GetQuestStatus(questId);
+
                         WorldPacket packet(CMSG_QUESTGIVER_ACCEPT_QUEST, 8 + 4 + 4);
                         packet << sourceItem->GetGUID();
-                        packet << itemTemplate->StartQuest;
+                        packet << questId;
                         packet << uint32(0);
                         bot->GetSession()->HandleQuestgiverAcceptQuestOpcode(packet);
-                        used = true;
-                        reason = "OK";
+
+                        QuestStatus const afterStatus = bot->GetQuestStatus(questId);
+                        used = beforeStatus == QUEST_STATUS_NONE && afterStatus != QUEST_STATUS_NONE;
+                        reason = used ? "OK" : "QUEST_NOT_ACCEPTED";
                     }
                     else
                     {
@@ -8483,11 +8598,8 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             return SendProtocolError(player, replyType, normalized, "", "", "BAD_VERSION");
 
         SendAddonPacket(player, replyType, "HELLO_ACK", std::string(kProtocolVersion) + kFieldSeparator + kBridgeName);
-        SendAddonPacket(
-            player,
-            replyType,
-            "CAPS",
-            std::string(kStateFramingCapability) + "," + kStrategyMutationCapability + "," + kOutfitCapability + "," + kInventoryCapability + "," + kInventoryExactCapability + "," + kInventoryItemMoveCapability + "," + kInventoryItemEquipCapability + "," + kInventoryItemUnequipCapability + "," + kInventoryItemDestroyCapability + "," + kInventoryItemUseCapability + "," + kInventoryItemSellCapability + "," + kVendorBuybackCapability + "," + kInventoryBulkSellCapability + "," + kInventoryOpenCapability + "," + kGroupRollCapability + "," + kEnchantTradeCapability);
+        if (!SendCapabilitiesPackets(player, replyType))
+            return SendProtocolError(player, replyType, normalized, "", "", "CAPS_BUILD_FAILED");
         return true;
     }
 
