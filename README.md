@@ -909,3 +909,39 @@ Thanks to the Playerbots team and the AzerothCore community.
 </a>
 
 </div>
+
+---
+
+## SELF_BOT_V1
+
+`SELF_BOT_V1` provides a specialized bridge-first control for the Playerbots
+self-bot mode used by the MultiBot SelfBot roster button.
+
+State query:
+
+```text
+Addon  -> Server: MBOT GET~SELF_BOT~<token>
+Server -> Addon:  MBOT SELF_BOT_STATE~<token>~<OK|ERR>~<0|1>~<reason>
+```
+
+State mutation:
+
+```text
+Addon  -> Server: MBOT RUN~SELF_BOT~<token>~ENABLE
+Addon  -> Server: MBOT RUN~SELF_BOT~<token>~DISABLE
+Server -> Addon:  MBOT SELF_BOT_RESULT~<token>~<OK|ERR>~<0|1>~<reason>
+```
+
+The operation uses an explicit desired state, so repeated valid requests are
+idempotent. The bridge never accepts an arbitrary Playerbots command for this
+endpoint. It invokes only the audited native
+`HandlePlayerbotCommand("self", requester)` path, then verifies the resulting
+`IsSelfBot(requester)` state.
+
+Activation mirrors the Playerbots `AiPlayerbot.SelfBotLevel` / GM restriction,
+rejects conflicting non-self PlayerbotAI state, and all SELF_BOT requests use a
+bounded per-requester rate limit.
+
+The addon updates the SelfBot button from structured server responses. The
+historical `.playerbot bot self` chat command is used only when
+`MultiBot.allowLegacyChatFallback == true`.
