@@ -16,6 +16,7 @@
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "PlayerbotAI.h"
+#include "PlayerbotAIConfig.h"
 #include "PlayerbotMgr.h"
 #include "PlayerbotRepository.h"
 #include "Playerbots.h"
@@ -114,6 +115,9 @@ std::size_t constexpr kVendorBuybackMaxRecentTokens = 32;
 std::size_t constexpr kVendorBuybackMaxRequesterStates = 512;
 std::size_t constexpr kGroupRollRateLimit = 4;
 std::chrono::milliseconds constexpr kGroupRollRateWindow(2000);
+std::size_t constexpr kSelfBotRateLimit = 8;
+std::chrono::milliseconds constexpr kSelfBotRateWindow(2000);
+std::size_t constexpr kSelfBotMaxRequesterStates = 512;
 std::size_t constexpr kEnchantTradeRateLimit = 4;
 std::chrono::milliseconds constexpr kEnchantTradeRateWindow(2000);
 std::size_t constexpr kMaxEnchantTradeEntries = 256;
@@ -134,6 +138,7 @@ char const* const kInventoryBulkSellCapability = "INVENTORY_BULK_SELL_V1";
 char const* const kInventoryOpenCapability = "INVENTORY_OPEN_V1";
 char const* const kGroupRollCapability = "GROUP_ROLL_V1";
 char const* const kEnchantTradeCapability = "ENCHANT_TRADE_V1";
+char const* const kSelfBotCapability = "SELF_BOT_V1";
 uint32 constexpr kMaxItemActionCount = 1000;
 uint32 constexpr kMaxInventoryItemMoveCount = 1000;
 uint32 constexpr kMaxInventoryItemEquipCount = 1000;
@@ -231,7 +236,8 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kInventoryBulkSellCapability,
         kInventoryOpenCapability,
         kGroupRollCapability,
-        kEnchantTradeCapability
+        kEnchantTradeCapability,
+        kSelfBotCapability
     };
 
     std::vector<std::string> chunks;
@@ -8611,6 +8617,133 @@ void SendStatsPackets(Player* player, ChatMsg replyType)
     }
 }
 
+// MB_ISSUE33_SELF_BOT_V1_BEGIN
+using SelfBotRateClock = std::chrono::steady_clock;
+std::map<uint32, std::deque<SelfBotRateClock::time_point>> gSelfBotRequestRateStates;
+
+bool ConsumeSelfBotRequestRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    SelfBotRateClock::time_point const now = SelfBotRateClock::now();
+    uint32 const requesterKey = requester->GetGUID().GetCounter();
+
+    auto pruneQueue = [now](std::deque<SelfBotRateClock::time_point>& attempts)
+    {
+        while (!attempts.empty() && now - attempts.front() >= kSelfBotRateWindow)
+            attempts.pop_front();
+    };
+
+    auto it = gSelfBotRequestRateStates.find(requesterKey);
+    if (it == gSelfBotRequestRateStates.end())
+    {
+        if (gSelfBotRequestRateStates.size() >= kSelfBotMaxRequesterStates)
+        {
+            for (auto stateIt = gSelfBotRequestRateStates.begin();
+                 stateIt != gSelfBotRequestRateStates.end();)
+            {
+                pruneQueue(stateIt->second);
+                if (stateIt->second.empty())
+                    stateIt = gSelfBotRequestRateStates.erase(stateIt);
+                else
+                    ++stateIt;
+            }
+        }
+
+        if (gSelfBotRequestRateStates.size() >= kSelfBotMaxRequesterStates)
+            return false;
+
+        it = gSelfBotRequestRateStates.emplace(
+            requesterKey, std::deque<SelfBotRateClock::time_point>()).first;
+    }
+
+    std::deque<SelfBotRateClock::time_point>& attempts = it->second;
+    pruneQueue(attempts);
+    if (attempts.size() >= kSelfBotRateLimit)
+        return false;
+
+    attempts.push_back(now);
+    return true;
+}
+
+void SendSelfBotPacket(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& opcode,
+    std::string const& requestToken,
+    std::string const& status,
+    std::string const& reason)
+{
+    if (!requester)
+        return;
+
+    std::ostringstream out;
+    out << requestToken
+        << kFieldSeparator << status
+        << kFieldSeparator << (IsSelfBot(requester) ? 1 : 0)
+        << kFieldSeparator << UrlEncodeField(reason);
+    SendAddonPacket(requester, replyType, opcode, out.str());
+}
+
+void RunSelfBotCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& desiredState)
+{
+    std::string status = "ERR";
+    std::string reason = "UNKNOWN";
+
+    if (!requester || !requester->GetSession())
+        reason = "NO_SESSION";
+    else
+    {
+        bool const desiredActive = desiredState == "ENABLE";
+        bool const currentActive = IsSelfBot(requester);
+
+        if (currentActive == desiredActive)
+        {
+            status = "OK";
+            reason = desiredActive ? "ALREADY_ENABLED" : "ALREADY_DISABLED";
+        }
+        else if (desiredActive && GET_PLAYERBOT_AI(requester) && !currentActive)
+            reason = "AI_STATE_CONFLICT";
+        else if (desiredActive && sPlayerbotAIConfig.selfBotLevel == 0)
+            reason = "DISABLED";
+        else if (desiredActive
+                 && sPlayerbotAIConfig.selfBotLevel == 1
+                 && !requester->CanBeGameMaster())
+            reason = "FORBIDDEN";
+        else
+        {
+            PlayerbotMgr* const mgr = GET_PLAYERBOT_MGR(requester);
+            if (!mgr)
+                reason = "NO_MANAGER";
+            else
+            {
+                mgr->HandlePlayerbotCommand("self", requester);
+                if (IsSelfBot(requester) == desiredActive)
+                {
+                    status = "OK";
+                    reason = "APPLIED";
+                }
+                else
+                    reason = "STATE_MISMATCH";
+            }
+        }
+    }
+
+    SendSelfBotPacket(
+        requester,
+        replyType,
+        "SELF_BOT_RESULT",
+        requestToken,
+        status,
+        reason);
+}
+// MB_ISSUE33_SELF_BOT_V1_END
+
 bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& opcode, std::string const& payload)
 {
     std::string const trimmedOpcode = Trim(opcode);
@@ -8659,6 +8792,29 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
                 return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_FIELD_COUNT");
 
             SendAddonPacket(player, replyType, "ROSTER", BuildRosterPayload(player));
+            return true;
+        }
+
+        if (requestType == "SELF_BOT")
+        {
+            std::string const token = GetSafeErrorToken(fields, 1);
+            if (fields.size() != 2)
+                return SendProtocolError(
+                    player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+            if (!IsValidRequestToken(fields[1]))
+                return SendProtocolError(
+                    player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+            if (!ConsumeSelfBotRequestRateLimit(player))
+            {
+                SendSelfBotPacket(
+                    player, replyType, "SELF_BOT_STATE", fields[1], "ERR", "RATE_LIMIT");
+                return true;
+            }
+
+            SendSelfBotPacket(
+                player, replyType, "SELF_BOT_STATE", fields[1], "OK", "STATE");
             return true;
         }
 
@@ -8974,6 +9130,36 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         }
 
         return SendProtocolError(player, replyType, normalized, requestType, "", "UNKNOWN_GET");
+    }
+
+    if (requestType == "SELF_BOT")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 3)
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        std::string const desiredState = ToUpper(Trim(fields[2]));
+        if (fields[2] != desiredState
+            || (desiredState != "ENABLE" && desiredState != "DISABLE"))
+        {
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_STATE");
+        }
+
+        if (!ConsumeSelfBotRequestRateLimit(player))
+        {
+            SendSelfBotPacket(
+                player, replyType, "SELF_BOT_RESULT", fields[1], "ERR", "RATE_LIMIT");
+            return true;
+        }
+
+        RunSelfBotCommand(player, replyType, fields[1], desiredState);
+        return true;
     }
 
     if (requestType == "OUTFIT")
