@@ -3096,6 +3096,11 @@ void SendInventoryExactSnapshot(Player* requester, ChatMsg replyType, std::strin
     if (!bot)
     {
         SendAddonPacket(requester, replyType, "INV_EXACT_BEGIN", prefixPayload);
+        SendAddonPacket(
+            requester,
+            replyType,
+            "INV_EXACT_ERROR",
+            prefixPayload + std::string(1, kFieldSeparator) + "NO_BOT");
         SendAddonPacket(requester, replyType, "INV_EXACT_END", prefixPayload);
         return;
     }
@@ -6073,11 +6078,15 @@ void RunInventoryItemUseCommand(
                                     uint32 const beforeCount = sourceItem->GetCount();
                                     bool const hadCooldown = bot->HasSpellCooldown(spellId);
 
+                                    uint32 const targetMask =
+                                        (spellInfo->Targets & TARGET_FLAG_UNIT) ? TARGET_FLAG_UNIT : TARGET_FLAG_NONE;
+
                                     WorldPacket packet(CMSG_USE_ITEM);
                                     packet << srcBag << srcSlot << uint8(1) << spellId
                                            << sourceGuid << uint32(0) << uint8(0);
-                                    packet << uint32(TARGET_FLAG_NONE);
-                                    packet << bot->GetPackGUID();
+                                    packet << targetMask;
+                                    if (targetMask & TARGET_FLAG_UNIT)
+                                        packet << bot->GetPackGUID();
                                     bot->GetSession()->HandleUseItemOpcode(packet);
 
                                     Item* const sourceAfter = bot->GetItemByGuid(sourceGuid);
