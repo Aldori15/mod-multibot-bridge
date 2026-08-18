@@ -139,6 +139,7 @@ char const* const kInventoryOpenCapability = "INVENTORY_OPEN_V1";
 char const* const kGroupRollCapability = "GROUP_ROLL_V1";
 char const* const kEnchantTradeCapability = "ENCHANT_TRADE_V1";
 char const* const kSelfBotCapability = "SELF_BOT_V1";
+char const* const kSelfStrategyCapability = "SELF_STRATEGY_V1";
 uint32 constexpr kMaxItemActionCount = 1000;
 uint32 constexpr kMaxInventoryItemMoveCount = 1000;
 uint32 constexpr kMaxInventoryItemEquipCount = 1000;
@@ -237,7 +238,8 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kInventoryOpenCapability,
         kGroupRollCapability,
         kEnchantTradeCapability,
-        kSelfBotCapability
+        kSelfBotCapability,
+        kSelfStrategyCapability
     };
 
     std::vector<std::string> chunks;
@@ -7746,6 +7748,112 @@ void RunStrategyMutationCommand(
         reason);
 }
 
+void SendSelfStrategyAck(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& stateScope,
+    std::string const& status,
+    std::string const& reason)
+{
+    std::ostringstream payload;
+    payload << requestToken
+        << kFieldSeparator << stateScope
+        << kFieldSeparator << status
+        << kFieldSeparator << UrlEncodeField(reason);
+
+    if (SendStateAddonPacket(requester, replyType, "SELF_STRATEGY_ACK", payload.str()))
+        return;
+
+    std::ostringstream fallbackPayload;
+    fallbackPayload << requestToken
+        << kFieldSeparator << stateScope
+        << kFieldSeparator << "ERR"
+        << kFieldSeparator << "ACK_TOO_LONG";
+    SendStateAddonPacket(requester, replyType, "SELF_STRATEGY_ACK", fallbackPayload.str());
+}
+
+bool IsAllowedSelfStrategyFoundationMutation(
+    BotState botState,
+    std::vector<StrategyMutationOperation> const& operations,
+    std::string& reason)
+{
+    if (botState != BOT_STATE_NON_COMBAT)
+    {
+        reason = "UNSUPPORTED_STATE";
+        return false;
+    }
+
+    for (StrategyMutationOperation const& operation : operations)
+    {
+        if (operation.name != "food" && operation.name != "loot" && operation.name != "gather")
+        {
+            reason = "UNSUPPORTED_STRATEGY";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void RunSelfStrategyMutationCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& stateScopeValue,
+    std::string const& encodedChanges)
+{
+    std::string const token = Trim(requestToken);
+    std::string const stateScope = ToUpper(Trim(stateScopeValue));
+    std::string status = "ERR";
+    std::string reason = "UNKNOWN";
+
+    if (!requester || !requester->GetSession())
+        reason = "NO_SESSION";
+    else if (stateScope != "C" && stateScope != "N")
+        reason = "BAD_STATE";
+    else
+    {
+        std::string rawChanges;
+        if (!TryUrlDecodeField(encodedChanges, rawChanges, kMaxCommandLength, false))
+            reason = "BAD_ENCODING";
+        else
+        {
+            std::string normalizedChanges;
+            std::vector<StrategyMutationOperation> operations;
+            if (!TryNormalizeStrategyChanges(rawChanges, normalizedChanges, operations, reason))
+            {
+                // reason already set by the shared strict normalizer.
+            }
+            else
+            {
+                BotState const botState = stateScope == "C" ? BOT_STATE_COMBAT : BOT_STATE_NON_COMBAT;
+                std::string const actionName = stateScope == "C" ? "co" : "nc";
+
+                if (!IsAllowedSelfStrategyFoundationMutation(botState, operations, reason))
+                {
+                    // Phase 2 foundation is intentionally limited to non-combat food/loot/gather.
+                }
+                else if (!ConsumeStrategyMutationRateLimit(requester))
+                    reason = "RATE_LIMIT";
+                else if (!IsSelfBot(requester))
+                    reason = "NOT_SELF_BOT";
+                else if (!GET_PLAYERBOT_AI(requester))
+                    reason = "NO_AI";
+                else if (ApplyNativeStrategyMutation(
+                    requester, requester, actionName, botState, normalizedChanges, operations))
+                {
+                    status = "OK";
+                    reason = "APPLIED";
+                }
+                else
+                    reason = "FAILED";
+            }
+        }
+    }
+
+    SendSelfStrategyAck(requester, replyType, token, stateScope, status, reason);
+}
 bool IsAllowedFormationName(std::string const& formation)
 {
     static std::set<std::string> const allowed =
@@ -8529,6 +8637,38 @@ void SendFramedStatePacket(Player* player, ChatMsg replyType, std::string const&
         SendStateAbort(player, replyType, token, bot->GetName(), "SEND_FAILED");
 }
 
+void SendSelfStrategyStatePacket(Player* player, ChatMsg replyType, std::string const& token)
+{
+    if (!player || !player->GetSession())
+    {
+        if (player)
+            SendStateAbort(player, replyType, token, player->GetName(), "NO_SESSION");
+        return;
+    }
+
+    if (!IsSelfBot(player))
+    {
+        SendStateAbort(player, replyType, token, player->GetName(), "NOT_SELF_BOT");
+        return;
+    }
+
+    if (!GET_PLAYERBOT_AI(player))
+    {
+        SendStateAbort(player, replyType, token, player->GetName(), "NO_AI");
+        return;
+    }
+
+    std::vector<std::pair<std::string, std::string>> packets;
+    std::string reason;
+    if (!AppendStateFramesForBot(packets, token, player, reason))
+    {
+        SendStateAbort(player, replyType, token, player->GetName(), reason);
+        return;
+    }
+
+    if (!SendPreparedStatePackets(player, replyType, packets))
+        SendStateAbort(player, replyType, token, player->GetName(), "SEND_FAILED");
+}
 void SendFramedStatePackets(Player* player, ChatMsg replyType, std::string const& token)
 {
     std::vector<Player*> const bots = GetBridgeVisibleBots(player);
@@ -8815,6 +8955,27 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
 
             SendSelfBotPacket(
                 player, replyType, "SELF_BOT_STATE", fields[1], "OK", "STATE");
+            return true;
+        }
+
+        if (requestType == "SELF_STRATEGY_STATE")
+        {
+            std::string const token = GetSafeErrorToken(fields, 1);
+            if (fields.size() != 2)
+                return SendProtocolError(
+                    player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+            if (!IsValidRequestToken(fields[1]))
+                return SendProtocolError(
+                    player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+            if (!ConsumeSelfBotRequestRateLimit(player))
+            {
+                SendStateAbort(player, replyType, fields[1], player ? player->GetName() : "", "RATE_LIMIT");
+                return true;
+            }
+
+            SendSelfStrategyStatePacket(player, replyType, fields[1]);
             return true;
         }
 
@@ -9159,6 +9320,29 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         }
 
         RunSelfBotCommand(player, replyType, fields[1], desiredState);
+        return true;
+    }
+
+    if (requestType == "SELF_STRATEGY")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 4)
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        if (fields[2] != "C" && fields[2] != "N")
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_STATE");
+
+        if (!IsValidEncodedField(fields[3], kMaxCommandLength, false))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_ENCODING");
+
+        RunSelfStrategyMutationCommand(player, replyType, fields[1], fields[2], fields[3]);
         return true;
     }
 
