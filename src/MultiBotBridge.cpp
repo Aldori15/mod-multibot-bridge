@@ -24,6 +24,7 @@
 #include "ReputationMgr.h"
 #include "AiObjectContext.h"
 #include "Event.h"
+#include "EventProcessor.h"
 #include "Trigger.h"
 #include "Formations.h"
 #include "ScriptedGossip.h"
@@ -118,6 +119,10 @@ std::chrono::milliseconds constexpr kGroupRollRateWindow(2000);
 std::size_t constexpr kSelfBotRateLimit = 8;
 std::chrono::milliseconds constexpr kSelfBotRateWindow(2000);
 std::size_t constexpr kSelfBotMaxRequesterStates = 512;
+std::size_t constexpr kWarlockStoneSwitchMaxPending = 512;
+std::size_t constexpr kWarlockStoneSwitchMaxApplyAttempts = 20;
+std::chrono::milliseconds constexpr kWarlockStoneSwitchApplyRetryDelay(100);
+std::chrono::milliseconds constexpr kWarlockStoneSwitchCreateTimeout(7000);
 std::size_t constexpr kEnchantTradeRateLimit = 4;
 std::chrono::milliseconds constexpr kEnchantTradeRateWindow(2000);
 std::size_t constexpr kMaxEnchantTradeEntries = 256;
@@ -7773,6 +7778,550 @@ void SendSelfStrategyAck(
     SendStateAddonPacket(requester, replyType, "SELF_STRATEGY_ACK", fallbackPayload.str());
 }
 
+enum class DeferredWarlockStoneStartResult
+{
+    NotApplicable,
+    Started,
+    Failed
+};
+
+struct PendingWarlockStoneSwitch
+{
+    std::string token;
+    std::string stateScope;
+    ChatMsg replyType = CHAT_MSG_WHISPER;
+    std::string desiredStone;
+    std::map<std::string, bool> priorStrategyStates;
+    bool hadFirestoneStrategy = false;
+    bool hadSpellstoneStrategy = false;
+    std::size_t applyAttempts = 0;
+    bool completionScheduled = false;
+};
+
+std::map<std::string, PendingWarlockStoneSwitch> sPendingWarlockStoneSwitches;
+
+bool HasNamedWarlockStoneItem(PlayerbotAI* botAI, std::string const& stoneName)
+{
+    if (!botAI || !botAI->GetAiObjectContext())
+        return false;
+
+    std::vector<Item*> const items =
+        botAI->GetAiObjectContext()->GetValue<std::vector<Item*>>("inventory items", stoneName)->Get();
+    return !items.empty();
+}
+
+bool IsTemporaryWeaponEnchantItem(Item* item)
+{
+    if (!item)
+        return false;
+
+    std::set<uint32> enchantIds;
+    CollectCarriedWarlockStoneEnchantIds(item, enchantIds);
+    return !enchantIds.empty();
+}
+
+bool TryGetRequestedWarlockStoneSwitch(
+    PlayerbotAI* botAI,
+    std::vector<StrategyMutationOperation> const& operations,
+    bool& hadFirestoneStrategy,
+    bool& hadSpellstoneStrategy,
+    std::string& desiredStone)
+{
+    desiredStone.clear();
+    if (!botAI)
+        return false;
+
+    hadFirestoneStrategy = botAI->HasStrategy("firestone", BOT_STATE_NON_COMBAT);
+    hadSpellstoneStrategy = botAI->HasStrategy("spellstone", BOT_STATE_NON_COMBAT);
+
+    bool hasFirestoneStrategy = hadFirestoneStrategy;
+    bool hasSpellstoneStrategy = hadSpellstoneStrategy;
+
+    for (StrategyMutationOperation const& operation : operations)
+    {
+        if (operation.name == "firestone")
+            hasFirestoneStrategy = operation.enable;
+        else if (operation.name == "spellstone")
+            hasSpellstoneStrategy = operation.enable;
+    }
+
+    if (!hadFirestoneStrategy && hadSpellstoneStrategy && hasFirestoneStrategy && !hasSpellstoneStrategy)
+        desiredStone = "firestone";
+    else if (hadFirestoneStrategy && !hadSpellstoneStrategy && !hasFirestoneStrategy && hasSpellstoneStrategy)
+        desiredStone = "spellstone";
+
+    return !desiredStone.empty();
+}
+
+bool RollbackPendingWarlockStoneStrategies(Player* player, PendingWarlockStoneSwitch const& pending)
+{
+    if (!player)
+        return false;
+
+    PlayerbotAI* const botAI = GetBotAI(player);
+    if (!botAI)
+        return false;
+
+    return RollbackNativeStrategyMutation(
+        player,
+        botAI,
+        "nc",
+        BOT_STATE_NON_COMBAT,
+        pending.priorStrategyStates);
+}
+
+void FinishPendingWarlockStoneSwitch(
+    Player* player,
+    std::string const& key,
+    std::string const& token,
+    bool success,
+    std::string const& reason)
+{
+    auto const pendingIt = sPendingWarlockStoneSwitches.find(key);
+    if (pendingIt == sPendingWarlockStoneSwitches.end() || pendingIt->second.token != token)
+        return;
+
+    PendingWarlockStoneSwitch const pending = pendingIt->second;
+
+    if (!success)
+    {
+        bool const rollbackSucceeded = RollbackPendingWarlockStoneStrategies(player, pending);
+        if (BridgeConsoleLogsEnabled())
+        {
+            LOG_INFO(
+                "playerbots",
+                "MultiBotBridge deferred warlock stone strategy rollback player={} requested={} reason={} succeeded={}",
+                player ? player->GetName() : key,
+                pending.desiredStone,
+                reason,
+                rollbackSucceeded);
+        }
+    }
+
+    sPendingWarlockStoneSwitches.erase(pendingIt);
+
+    if (player && player->GetSession())
+    {
+        SendSelfStrategyAck(
+            player,
+            pending.replyType,
+            pending.token,
+            pending.stateScope,
+            success ? "OK" : "ERR",
+            success ? "APPLIED" : reason);
+    }
+}
+
+void SchedulePendingWarlockStoneCompletion(Player* player, std::string const& key, std::string const& token);
+
+void CompletePendingWarlockStoneSwitch(Player* player, std::string const& key, std::string const& token)
+{
+    auto pendingIt = sPendingWarlockStoneSwitches.find(key);
+    if (pendingIt == sPendingWarlockStoneSwitches.end() || pendingIt->second.token != token)
+        return;
+
+    PendingWarlockStoneSwitch& pending = pendingIt->second;
+    ++pending.applyAttempts;
+
+    if (!player || !player->GetSession() || !IsSelfBot(player) || player->getClass() != CLASS_WARLOCK)
+    {
+        FinishPendingWarlockStoneSwitch(player, key, token, false, "STONE_STATE_INVALID");
+        return;
+    }
+
+    PlayerbotAI* const botAI = GetBotAI(player);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, player))
+    {
+        FinishPendingWarlockStoneSwitch(player, key, token, false, "STONE_NO_AI");
+        return;
+    }
+
+    if (player->IsInCombat())
+    {
+        FinishPendingWarlockStoneSwitch(player, key, token, false, "STONE_COMBAT");
+        return;
+    }
+
+    if (player->IsNonMeleeSpellCast(false) || !HasNamedWarlockStoneItem(botAI, pending.desiredStone))
+    {
+        if (pending.applyAttempts < kWarlockStoneSwitchMaxApplyAttempts)
+        {
+            SchedulePendingWarlockStoneCompletion(player, key, token);
+            return;
+        }
+
+        FinishPendingWarlockStoneSwitch(player, key, token, false, "STONE_ITEM_NOT_READY");
+        return;
+    }
+
+    WarlockStoneSwitchResult const result = TryForceWarlockStoneSwitch(
+        player,
+        player,
+        botAI,
+        BOT_STATE_NON_COMBAT,
+        pending.hadFirestoneStrategy,
+        pending.hadSpellstoneStrategy);
+
+    if (result == WarlockStoneSwitchResult::Applied)
+    {
+        if (BridgeConsoleLogsEnabled())
+        {
+            LOG_INFO(
+                "playerbots",
+                "MultiBotBridge deferred warlock stone switch applied player={} requested={} attempts={}",
+                player->GetName(),
+                pending.desiredStone,
+                pending.applyAttempts);
+        }
+
+        FinishPendingWarlockStoneSwitch(player, key, token, true, "APPLIED");
+        return;
+    }
+
+    FinishPendingWarlockStoneSwitch(player, key, token, false, "STONE_APPLY_FAILED");
+}
+
+void SchedulePendingWarlockStoneCompletion(Player* player, std::string const& key, std::string const& token)
+{
+    if (!player)
+        return;
+
+    player->m_Events.AddEventAtOffset(
+        [player, key, token]()
+        {
+            CompletePendingWarlockStoneSwitch(player, key, token);
+        },
+        kWarlockStoneSwitchApplyRetryDelay);
+}
+
+void TimeoutPendingWarlockStoneSwitch(Player* player, std::string const& key, std::string const& token)
+{
+    auto const pendingIt = sPendingWarlockStoneSwitches.find(key);
+    if (pendingIt == sPendingWarlockStoneSwitches.end() || pendingIt->second.token != token)
+        return;
+
+    if (BridgeConsoleLogsEnabled())
+    {
+        LOG_INFO(
+            "playerbots",
+            "MultiBotBridge deferred warlock stone switch timeout player={} requested={}",
+            player ? player->GetName() : key,
+            pendingIt->second.desiredStone);
+    }
+
+    FinishPendingWarlockStoneSwitch(player, key, token, false, "STONE_CREATE_TIMEOUT");
+}
+
+void NotifyPendingWarlockStoneItemCreated(Player* player, Item* item)
+{
+    if (!player || !item || !IsTemporaryWeaponEnchantItem(item))
+        return;
+
+    std::string const key = player->GetName();
+    auto pendingIt = sPendingWarlockStoneSwitches.find(key);
+    if (pendingIt == sPendingWarlockStoneSwitches.end() || pendingIt->second.completionScheduled)
+        return;
+
+    pendingIt->second.completionScheduled = true;
+
+    if (BridgeConsoleLogsEnabled())
+    {
+        LOG_INFO(
+            "playerbots",
+            "MultiBotBridge deferred warlock stone item created player={} requested={} itemEntry={}",
+            player->GetName(),
+            pendingIt->second.desiredStone,
+            item->GetEntry());
+    }
+
+    SchedulePendingWarlockStoneCompletion(player, key, pendingIt->second.token);
+}
+
+void CancelPendingWarlockStoneSwitch(Player* player, std::string const& reason, bool sendAck)
+{
+    if (!player)
+        return;
+
+    std::string const key = player->GetName();
+    auto const pendingIt = sPendingWarlockStoneSwitches.find(key);
+    if (pendingIt == sPendingWarlockStoneSwitches.end())
+        return;
+
+    PendingWarlockStoneSwitch const pending = pendingIt->second;
+    bool const rollbackSucceeded = RollbackPendingWarlockStoneStrategies(player, pending);
+    sPendingWarlockStoneSwitches.erase(pendingIt);
+
+    if (BridgeConsoleLogsEnabled())
+    {
+        LOG_INFO(
+            "playerbots",
+            "MultiBotBridge deferred warlock stone switch cancelled player={} requested={} reason={} rollback={}",
+            player->GetName(),
+            pending.desiredStone,
+            reason,
+            rollbackSucceeded);
+    }
+
+    if (sendAck && player->GetSession())
+    {
+        SendSelfStrategyAck(
+            player,
+            pending.replyType,
+            pending.token,
+            pending.stateScope,
+            "ERR",
+            reason);
+    }
+}
+
+DeferredWarlockStoneStartResult TryBeginDeferredSelfWarlockStoneSwitch(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& token,
+    std::string const& stateScope,
+    std::string const& normalizedChanges,
+    std::vector<StrategyMutationOperation> const& operations,
+    std::string& failureReason)
+{
+    if (!requester || stateScope != "N" || requester->getClass() != CLASS_WARLOCK)
+        return DeferredWarlockStoneStartResult::NotApplicable;
+
+    PlayerbotAI* const botAI = GetBotAI(requester);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+    {
+        failureReason = "STONE_NO_AI";
+        return DeferredWarlockStoneStartResult::Failed;
+    }
+
+    bool hadFirestoneStrategy = false;
+    bool hadSpellstoneStrategy = false;
+    std::string desiredStone;
+    if (!TryGetRequestedWarlockStoneSwitch(
+        botAI,
+        operations,
+        hadFirestoneStrategy,
+        hadSpellstoneStrategy,
+        desiredStone))
+    {
+        return DeferredWarlockStoneStartResult::NotApplicable;
+    }
+
+    Item* const mainHand = requester->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+    if (!mainHand)
+        return DeferredWarlockStoneStartResult::NotApplicable;
+
+    uint32 const currentEnchantId = mainHand->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT);
+    if (!currentEnchantId)
+        return DeferredWarlockStoneStartResult::NotApplicable;
+
+    std::set<uint32> const carriedStoneEnchantIds = GetCarriedWarlockStoneEnchantIds(requester);
+    if (carriedStoneEnchantIds.find(currentEnchantId) == carriedStoneEnchantIds.end())
+        return DeferredWarlockStoneStartResult::NotApplicable;
+
+    if (HasNamedWarlockStoneItem(botAI, desiredStone))
+        return DeferredWarlockStoneStartResult::NotApplicable;
+
+    if (requester->IsInCombat())
+    {
+        failureReason = "STONE_COMBAT";
+        return DeferredWarlockStoneStartResult::Failed;
+    }
+
+    std::string const key = requester->GetName();
+    if (sPendingWarlockStoneSwitches.find(key) != sPendingWarlockStoneSwitches.end())
+    {
+        failureReason = "STONE_SWITCH_PENDING";
+        return DeferredWarlockStoneStartResult::Failed;
+    }
+
+    if (sPendingWarlockStoneSwitches.size() >= kWarlockStoneSwitchMaxPending)
+    {
+        failureReason = "STONE_PENDING_LIMIT";
+        return DeferredWarlockStoneStartResult::Failed;
+    }
+
+    std::map<std::string, bool> const priorStrategyStates =
+        CaptureStrategyMutationState(botAI, BOT_STATE_NON_COMBAT, operations);
+
+    if (!botAI->DoSpecificAction("nc", Event("nc", normalizedChanges, requester), true) ||
+        !VerifyStrategyMutationResult(botAI, BOT_STATE_NON_COMBAT, operations))
+    {
+        failureReason = "STONE_STRATEGY_FAILED";
+        return DeferredWarlockStoneStartResult::Failed;
+    }
+
+    PendingWarlockStoneSwitch pending;
+    pending.token = token;
+    pending.stateScope = stateScope;
+    pending.replyType = replyType;
+    pending.desiredStone = desiredStone;
+    pending.priorStrategyStates = priorStrategyStates;
+    pending.hadFirestoneStrategy = hadFirestoneStrategy;
+    pending.hadSpellstoneStrategy = hadSpellstoneStrategy;
+
+    sPendingWarlockStoneSwitches.emplace(key, pending);
+
+    requester->m_Events.AddEventAtOffset(
+        [requester, key, token]()
+        {
+            TimeoutPendingWarlockStoneSwitch(requester, key, token);
+        },
+        kWarlockStoneSwitchCreateTimeout);
+
+    std::string const createAction = "create " + desiredStone;
+    if (!botAI->DoSpecificAction(createAction, Event(), true))
+    {
+        PendingWarlockStoneSwitch const failedPending = sPendingWarlockStoneSwitches[key];
+        sPendingWarlockStoneSwitches.erase(key);
+        bool const rollbackSucceeded = RollbackPendingWarlockStoneStrategies(requester, failedPending);
+
+        if (BridgeConsoleLogsEnabled())
+        {
+            LOG_INFO(
+                "playerbots",
+                "MultiBotBridge deferred warlock stone create failed player={} requested={} rollback={}",
+                requester->GetName(),
+                desiredStone,
+                rollbackSucceeded);
+        }
+
+        failureReason = "STONE_CREATE_FAILED";
+        return DeferredWarlockStoneStartResult::Failed;
+    }
+
+    if (BridgeConsoleLogsEnabled())
+    {
+        LOG_INFO(
+            "playerbots",
+            "MultiBotBridge deferred warlock stone create started player={} requested={} token={}",
+            requester->GetName(),
+            desiredStone,
+            token);
+    }
+
+    return DeferredWarlockStoneStartResult::Started;
+}
+
+
+bool IsAllowedSelfCombatStrategyForClass(Player* requester, std::string const& name)
+{
+    if (name == "dps assist"
+        || name == "dps aoe"
+        || name == "tank assist"
+        || name == "avoid aoe"
+        || name == "save mana"
+        || name == "threat"
+        || name == "behind")
+    {
+        return true;
+    }
+
+    if (!requester)
+        return false;
+
+    switch (requester->getClass())
+    {
+        case CLASS_DEATH_KNIGHT:
+            return name == "blood"
+                || name == "frost"
+                || name == "frost aoe"
+                || name == "tank face"
+                || name == "unholy"
+                || name == "unholy aoe";
+        case CLASS_DRUID:
+            return name == "aoe"
+                || name == "balance"
+                || name == "bear"
+                || name == "cat"
+                || name == "healer dps"
+                || name == "offheal"
+                || name == "resto"
+                || name == "tank face";
+        case CLASS_HUNTER:
+            return name == "aoe"
+                || name == "bdps"
+                || name == "bm"
+                || name == "bspeed"
+                || name == "mm"
+                || name == "rnature"
+                || name == "surv"
+                || name == "trap weave";
+        case CLASS_MAGE:
+            return name == "aoe"
+                || name == "arcane"
+                || name == "fire"
+                || name == "firestarter"
+                || name == "frost"
+                || name == "frostfire";
+        case CLASS_PALADIN:
+            return name == "baoe"
+                || name == "barmor"
+                || name == "bcast"
+                || name == "bspeed"
+                || name == "dps"
+                || name == "heal"
+                || name == "healer dps"
+                || name == "offheal"
+                || name == "rfire"
+                || name == "rfrost"
+                || name == "rshadow"
+                || name == "tank"
+                || name == "tank face";
+        case CLASS_PRIEST:
+            return name == "heal"
+                || name == "healer dps"
+                || name == "holy dps"
+                || name == "holy heal"
+                || name == "shadow"
+                || name == "shadow aoe"
+                || name == "shadow debuff";
+        case CLASS_ROGUE:
+            return name == "boost"
+                || name == "dps"
+                || name == "stealthed";
+        case CLASS_SHAMAN:
+            return name == "aoe"
+                || name == "cleansing"
+                || name == "cure"
+                || name == "earthbind"
+                || name == "ele"
+                || name == "enh"
+                || name == "fire resistance"
+                || name == "flametongue"
+                || name == "frost resistance"
+                || name == "grounding"
+                || name == "healer dps"
+                || name == "healing stream"
+                || name == "magma"
+                || name == "mana spring"
+                || name == "nature resistance"
+                || name == "resto"
+                || name == "searing"
+                || name == "stoneskin"
+                || name == "strength of earth"
+                || name == "tremor"
+                || name == "windfury"
+                || name == "wrath"
+                || name == "wrath of air";
+        case CLASS_WARLOCK:
+            return name == "curse of agony"
+                || name == "curse of doom"
+                || name == "curse of elements"
+                || name == "curse of exhaustion"
+                || name == "curse of tongues"
+                || name == "curse of weakness"
+                || name == "meta melee"
+                || name == "tank";
+        case CLASS_WARRIOR:
+            return name == "tank"
+                || name == "tank face";
+        default:
+            return false;
+    }
+}
+
 bool IsAllowedSelfStrategyFoundationMutation(
     Player* requester,
     BotState botState,
@@ -7783,7 +8332,27 @@ bool IsAllowedSelfStrategyFoundationMutation(
     {
         for (StrategyMutationOperation const& operation : operations)
         {
-            if (operation.name != "food" && operation.name != "loot" && operation.name != "gather")
+            bool allowed = operation.name == "food"
+                || operation.name == "loot"
+                || operation.name == "gather"
+                || (operation.name == "mount" && !operation.enable);
+
+            if (!allowed && requester && requester->getClass() == CLASS_WARLOCK)
+            {
+                allowed = operation.name == "imp"
+                    || operation.name == "voidwalker"
+                    || operation.name == "succubus"
+                    || operation.name == "felhunter"
+                    || operation.name == "felguard"
+                    || operation.name == "ss self"
+                    || operation.name == "ss master"
+                    || operation.name == "ss tank"
+                    || operation.name == "ss healer"
+                    || operation.name == "spellstone"
+                    || operation.name == "firestone";
+            }
+
+            if (!allowed)
             {
                 reason = "UNSUPPORTED_STRATEGY";
                 return false;
@@ -7801,25 +8370,11 @@ bool IsAllowedSelfStrategyFoundationMutation(
 
     for (StrategyMutationOperation const& operation : operations)
     {
-        if (operation.name == "dps assist"
-            || operation.name == "dps aoe"
-            || operation.name == "tank assist")
+        if (!IsAllowedSelfCombatStrategyForClass(requester, operation.name))
         {
-            continue;
+            reason = "UNSUPPORTED_STRATEGY";
+            return false;
         }
-
-        if (operation.name == "healer dps"
-            && requester
-            && (requester->getClass() == CLASS_DRUID
-                || requester->getClass() == CLASS_PALADIN
-                || requester->getClass() == CLASS_PRIEST
-                || requester->getClass() == CLASS_SHAMAN))
-        {
-            continue;
-        }
-
-        reason = "UNSUPPORTED_STRATEGY";
-        return false;
     }
 
     return true;
@@ -7869,14 +8424,32 @@ void RunSelfStrategyMutationCommand(
                     reason = "NOT_SELF_BOT";
                 else if (!GET_PLAYERBOT_AI(requester))
                     reason = "NO_AI";
-                else if (ApplyNativeStrategyMutation(
-                    requester, requester, actionName, botState, normalizedChanges, operations))
-                {
-                    status = "OK";
-                    reason = "APPLIED";
-                }
                 else
-                    reason = "FAILED";
+                {
+                    std::string deferredFailureReason;
+                    DeferredWarlockStoneStartResult const deferredResult =
+                        TryBeginDeferredSelfWarlockStoneSwitch(
+                            requester,
+                            replyType,
+                            token,
+                            stateScope,
+                            normalizedChanges,
+                            operations,
+                            deferredFailureReason);
+
+                    if (deferredResult == DeferredWarlockStoneStartResult::Started)
+                        return;
+                    if (deferredResult == DeferredWarlockStoneStartResult::Failed)
+                        reason = deferredFailureReason.empty() ? "FAILED" : deferredFailureReason;
+                    else if (ApplyNativeStrategyMutation(
+                        requester, requester, actionName, botState, normalizedChanges, operations))
+                    {
+                        status = "OK";
+                        reason = "APPLIED";
+                    }
+                    else
+                        reason = "FAILED";
+                }
             }
         }
     }
@@ -9876,6 +10449,21 @@ public:
         }
 
         return HandleBridgeOpcode(player, replyType, packet.first, packet.second);
+    }
+
+    void OnPlayerCreateItem(Player* player, Item* item, uint32 /*count*/) override
+    {
+        NotifyPendingWarlockStoneItemCreated(player, item);
+    }
+
+    void OnPlayerBeforeLogout(Player* player) override
+    {
+        CancelPendingWarlockStoneSwitch(player, "STONE_LOGOUT", false);
+    }
+
+    void OnPlayerMapChanged(Player* player) override
+    {
+        CancelPendingWarlockStoneSwitch(player, "STONE_MAP_CHANGED", true);
     }
 
     bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Player* /*receiver*/) override
