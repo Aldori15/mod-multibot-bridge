@@ -7774,11 +7774,26 @@ void SendSelfStrategyAck(
 }
 
 bool IsAllowedSelfStrategyFoundationMutation(
+    Player* requester,
     BotState botState,
     std::vector<StrategyMutationOperation> const& operations,
     std::string& reason)
 {
-    if (botState != BOT_STATE_NON_COMBAT)
+    if (botState == BOT_STATE_NON_COMBAT)
+    {
+        for (StrategyMutationOperation const& operation : operations)
+        {
+            if (operation.name != "food" && operation.name != "loot" && operation.name != "gather")
+            {
+                reason = "UNSUPPORTED_STRATEGY";
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    if (botState != BOT_STATE_COMBAT)
     {
         reason = "UNSUPPORTED_STATE";
         return false;
@@ -7786,11 +7801,22 @@ bool IsAllowedSelfStrategyFoundationMutation(
 
     for (StrategyMutationOperation const& operation : operations)
     {
-        if (operation.name != "food" && operation.name != "loot" && operation.name != "gather")
+        if (operation.name == "dps assist"
+            || operation.name == "dps aoe"
+            || operation.name == "tank assist")
         {
-            reason = "UNSUPPORTED_STRATEGY";
-            return false;
+            continue;
         }
+
+        if (operation.name == "healer dps"
+            && requester
+            && requester->getClass() == CLASS_PRIEST)
+        {
+            continue;
+        }
+
+        reason = "UNSUPPORTED_STRATEGY";
+        return false;
     }
 
     return true;
@@ -7830,9 +7856,9 @@ void RunSelfStrategyMutationCommand(
                 BotState const botState = stateScope == "C" ? BOT_STATE_COMBAT : BOT_STATE_NON_COMBAT;
                 std::string const actionName = stateScope == "C" ? "co" : "nc";
 
-                if (!IsAllowedSelfStrategyFoundationMutation(botState, operations, reason))
+                if (!IsAllowedSelfStrategyFoundationMutation(requester, botState, operations, reason))
                 {
-                    // Phase 2 foundation is intentionally limited to non-combat food/loot/gather.
+                    // SelfBot mutations remain restricted by the state- and class-aware server allowlist.
                 }
                 else if (!ConsumeStrategyMutationRateLimit(requester))
                     reason = "RATE_LIMIT";
