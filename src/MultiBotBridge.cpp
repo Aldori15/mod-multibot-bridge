@@ -17,6 +17,7 @@
 #include "Player.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotAIConfig.h"
+#include "PlayerbotFactory.h"
 #include "PlayerbotMgr.h"
 #include "PlayerbotRepository.h"
 #include "Playerbots.h"
@@ -145,6 +146,7 @@ char const* const kGroupRollCapability = "GROUP_ROLL_V1";
 char const* const kEnchantTradeCapability = "ENCHANT_TRADE_V1";
 char const* const kSelfBotCapability = "SELF_BOT_V1";
 char const* const kSelfStrategyCapability = "SELF_STRATEGY_V1";
+char const* const kSelfActionCapability = "SELF_ACTION_V1";
 uint32 constexpr kMaxItemActionCount = 1000;
 uint32 constexpr kMaxInventoryItemMoveCount = 1000;
 uint32 constexpr kMaxInventoryItemEquipCount = 1000;
@@ -167,6 +169,7 @@ bool BridgeConsoleLogsEnabled()
 
 Player* FindBotByName(Player* player, std::string const& botName);
 PlayerbotAI* GetBotAI(Player* bot);
+bool ConsumeSelfBotRequestRateLimit(Player* requester);
 std::vector<Player*> GetBridgeVisibleBots(Player* player);
 void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload = "");
 bool SendStateAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload);
@@ -244,7 +247,8 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kGroupRollCapability,
         kEnchantTradeCapability,
         kSelfBotCapability,
-        kSelfStrategyCapability
+        kSelfStrategyCapability,
+        kSelfActionCapability
     };
 
     std::vector<std::string> chunks;
@@ -8213,7 +8217,8 @@ bool IsAllowedSelfCombatStrategyForClass(Player* requester, std::string const& n
         || name == "avoid aoe"
         || name == "save mana"
         || name == "threat"
-        || name == "behind")
+        || name == "behind"
+        || name == "focus")
     {
         return true;
     }
@@ -8337,6 +8342,46 @@ bool IsAllowedSelfStrategyFoundationMutation(
                 || operation.name == "gather"
                 || (operation.name == "mount" && !operation.enable);
 
+            if (!allowed && requester)
+            {
+                switch (requester->getClass())
+                {
+                    case CLASS_DRUID:
+                        allowed = operation.name == "buff";
+                        break;
+                    case CLASS_HUNTER:
+                        allowed = operation.name == "rnature"
+                            || operation.name == "bspeed"
+                            || operation.name == "bdps";
+                        break;
+                    case CLASS_MAGE:
+                        allowed = operation.name == "bmana"
+                            || operation.name == "bdps";
+                        break;
+                    case CLASS_PALADIN:
+                        allowed = operation.name == "bsanc"
+                            || operation.name == "bwisdom"
+                            || operation.name == "bkings"
+                            || operation.name == "bmight"
+                            || operation.name == "bspeed"
+                            || operation.name == "rfire"
+                            || operation.name == "rfrost"
+                            || operation.name == "rshadow"
+                            || operation.name == "baoe"
+                            || operation.name == "barmor"
+                            || operation.name == "bcast";
+                        break;
+                    case CLASS_PRIEST:
+                        allowed = operation.name == "buff"
+                            || operation.name == "rshadow";
+                        break;
+                    case CLASS_ROGUE:
+                        allowed = operation.name == "stealth";
+                        break;
+                    default:
+                        break;
+                }
+            }
             if (!allowed && requester && requester->getClass() == CLASS_WARLOCK)
             {
                 allowed = operation.name == "imp"
@@ -8380,6 +8425,181 @@ bool IsAllowedSelfStrategyFoundationMutation(
     return true;
 }
 
+void SendSelfActionAck(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& action,
+    bool ok,
+    std::string const& reason)
+{
+    if (!requester)
+        return;
+
+    std::ostringstream payload;
+    payload << requestToken
+        << kFieldSeparator << action
+        << kFieldSeparator << (ok ? "OK" : "ERR")
+        << kFieldSeparator << UrlEncodeField(reason);
+
+    if (SendStateAddonPacket(requester, replyType, "SELF_ACTION_ACK", payload.str()))
+        return;
+
+    std::ostringstream fallbackPayload;
+    fallbackPayload << requestToken
+        << kFieldSeparator << action
+        << kFieldSeparator << "ERR"
+        << kFieldSeparator << "ACK_TOO_LONG";
+    SendStateAddonPacket(requester, replyType, "SELF_ACTION_ACK", fallbackPayload.str());
+}
+
+void RunSelfActionCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& actionValue,
+    std::string const& argumentValue)
+{
+    std::string const token = Trim(requestToken);
+    std::string const action = ToUpper(Trim(actionValue));
+    std::string const argument = Trim(argumentValue);
+    bool ok = false;
+    std::string reason = "BAD_REQUEST";
+
+    if (!requester || !requester->GetSession())
+        reason = "NO_SESSION";
+    else if (!IsSelfBot(requester))
+        reason = "NOT_SELF_BOT";
+    else if (!ConsumeSelfBotRequestRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else
+    {
+        PlayerbotAI* const botAI = GetBotAI(requester);
+        if (!botAI)
+            reason = "NO_AI";
+        else if (!botAI->GetSecurity() ||
+                 !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+            reason = "FORBIDDEN";
+        else if (action == "WAIT_ATTACK_TIME")
+        {
+            if (argument != "0" && argument != "3" && argument != "5" && argument != "10")
+                reason = "BAD_ARGUMENT";
+            else if (!botAI->GetAiObjectContext())
+                reason = "NO_CONTEXT";
+            else
+            {
+                uint8 const value = static_cast<uint8>(std::strtoul(argument.c_str(), nullptr, 10));
+                botAI->GetAiObjectContext()->GetValue<uint8>("wait for attack time")->Set(value);
+                ok = true;
+                reason = "APPLIED";
+            }
+        }
+        else if (action == "AUTOGEAR")
+        {
+            if (!argument.empty())
+                reason = "BAD_ARGUMENT";
+            else if (!sPlayerbotAIConfig.autoGearCommand)
+                reason = "DISABLED";
+            else if (!sPlayerbotAIConfig.autoGearCommandAltBots &&
+                     !sPlayerbotAIConfig.IsInRandomAccountList(requester->GetSession()->GetAccountId()))
+                reason = "ALT_BOT_REFUSED";
+            else
+            {
+                uint32 const quality = static_cast<uint32>(sPlayerbotAIConfig.autoGearQualityLimit);
+                uint32 const ilvl = static_cast<uint32>(sPlayerbotAIConfig.autoGearScoreLimit);
+                PlayerbotFactory::AutoGear(requester, quality, ilvl, true);
+                ok = true;
+                reason = "APPLIED";
+            }
+        }
+        else if (action == "MAINTENANCE")
+        {
+            if (!argument.empty())
+                reason = "BAD_ARGUMENT";
+            else if (!sPlayerbotAIConfig.maintenanceCommand)
+                reason = "DISABLED";
+            else
+            {
+                PlayerbotFactory factory(requester, requester->GetLevel());
+
+                if (!botAI->IsAltBot())
+                {
+                    factory.InitAttunementQuests();
+                    factory.InitBags(false);
+                    factory.InitAmmo();
+                    factory.InitFood();
+                    factory.InitReagents();
+                    factory.InitConsumables();
+                    factory.InitPotions();
+                    factory.InitTalentsTree(true);
+                    factory.InitPet();
+                    factory.InitPetTalents();
+                    factory.InitSkills();
+                    factory.InitClassSpells();
+                    factory.InitAvailableSpells();
+                    factory.InitReputation();
+                    factory.InitSpecialSpells();
+                    factory.InitMounts();
+                    factory.InitGlyphs(false);
+                    factory.InitKeyring();
+                    if (requester->GetLevel() >= sPlayerbotAIConfig.minEnchantingBotLevel)
+                        factory.ApplyEnchantAndGemsNew();
+                }
+                else
+                {
+                    if (sPlayerbotAIConfig.altMaintenanceAttunementQs)
+                        factory.InitAttunementQuests();
+                    if (sPlayerbotAIConfig.altMaintenanceBags)
+                        factory.InitBags(false);
+                    if (sPlayerbotAIConfig.altMaintenanceAmmo)
+                        factory.InitAmmo();
+                    if (sPlayerbotAIConfig.altMaintenanceFood)
+                        factory.InitFood();
+                    if (sPlayerbotAIConfig.altMaintenanceReagents)
+                        factory.InitReagents();
+                    if (sPlayerbotAIConfig.altMaintenanceConsumables)
+                        factory.InitConsumables();
+                    if (sPlayerbotAIConfig.altMaintenancePotions)
+                        factory.InitPotions();
+                    if (sPlayerbotAIConfig.altMaintenanceTalentTree)
+                        factory.InitTalentsTree(true);
+                    if (sPlayerbotAIConfig.altMaintenancePet)
+                        factory.InitPet();
+                    if (sPlayerbotAIConfig.altMaintenancePetTalents)
+                        factory.InitPetTalents();
+                    if (sPlayerbotAIConfig.altMaintenanceSkills)
+                        factory.InitSkills();
+                    if (sPlayerbotAIConfig.altMaintenanceClassSpells)
+                        factory.InitClassSpells();
+                    if (sPlayerbotAIConfig.altMaintenanceAvailableSpells)
+                        factory.InitAvailableSpells();
+                    if (sPlayerbotAIConfig.altMaintenanceReputation)
+                        factory.InitReputation();
+                    if (sPlayerbotAIConfig.altMaintenanceSpecialSpells)
+                        factory.InitSpecialSpells();
+                    if (sPlayerbotAIConfig.altMaintenanceMounts)
+                        factory.InitMounts();
+                    if (sPlayerbotAIConfig.altMaintenanceGlyphs)
+                        factory.InitGlyphs(false);
+                    if (sPlayerbotAIConfig.altMaintenanceKeyring)
+                        factory.InitKeyring();
+                    if (sPlayerbotAIConfig.altMaintenanceGemsEnchants &&
+                        requester->GetLevel() >= sPlayerbotAIConfig.minEnchantingBotLevel)
+                        factory.ApplyEnchantAndGemsNew();
+                }
+
+                requester->DurabilityRepairAll(false, 1.0f, false);
+                requester->SendTalentsInfoData(false);
+                ok = true;
+                reason = "APPLIED";
+            }
+        }
+        else
+            reason = "UNSUPPORTED_ACTION";
+    }
+
+    SendSelfActionAck(requester, replyType, token, action, ok, reason);
+}
 void RunSelfStrategyMutationCommand(
     Player* requester,
     ChatMsg replyType,
@@ -9925,6 +10145,28 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         return true;
     }
 
+    if (requestType == "SELF_ACTION")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 4)
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_TOKEN");
+
+        if (!IsValidProtocolName(fields[2], kMaxRequestTypeLength))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_ACTION");
+
+        if (!IsValidRawField(fields[3], 16, true))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_ARGUMENT");
+
+        RunSelfActionCommand(player, replyType, fields[1], fields[2], fields[3]);
+        return true;
+    }
     if (requestType == "SELF_STRATEGY")
     {
         std::string const token = GetSafeErrorToken(fields, 1);
