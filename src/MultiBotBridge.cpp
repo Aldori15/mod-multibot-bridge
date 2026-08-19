@@ -7810,7 +7810,10 @@ bool IsAllowedSelfStrategyFoundationMutation(
 
         if (operation.name == "healer dps"
             && requester
-            && requester->getClass() == CLASS_PRIEST)
+            && (requester->getClass() == CLASS_DRUID
+                || requester->getClass() == CLASS_PALADIN
+                || requester->getClass() == CLASS_PRIEST
+                || requester->getClass() == CLASS_SHAMAN))
         {
             continue;
         }
