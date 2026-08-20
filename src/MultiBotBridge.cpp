@@ -8103,11 +8103,13 @@ DeferredWarlockStoneStartResult TryBeginDeferredSelfWarlockStoneSwitch(
     }
 
     std::string const key = requester->GetName();
-    if (sPendingWarlockStoneSwitches.find(key) != sPendingWarlockStoneSwitches.end())
+    auto const existingPendingIt = sPendingWarlockStoneSwitches.find(key);
+    if (existingPendingIt != sPendingWarlockStoneSwitches.end())
     {
+        PendingWarlockStoneSwitch const& pending = existingPendingIt->second;
         for (StrategyMutationOperation const& operation : operations)
         {
-            if (operation.name == "firestone" || operation.name == "spellstone")
+            if (pending.priorStrategyStates.find(operation.name) != pending.priorStrategyStates.end())
             {
                 failureReason = "STONE_SWITCH_PENDING";
                 return DeferredWarlockStoneStartResult::Failed;
