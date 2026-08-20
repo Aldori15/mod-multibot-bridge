@@ -329,6 +329,19 @@ Server -> Addon:  MBOT FORMATIONS_END~<token>~<sentCount>
 Addon  -> Server: MBOT RUN~STRATEGY~<scope>~<target>~<token>~<stateScope>~<changes>
 Server -> Addon:  MBOT STRATEGY_ACK~<scope>~<target>~<token>~<stateScope>~<matched>~<succeeded>~<failed>~<reason>
 
+Addon  -> Server: MBOT GET~SELF_BOT~<token>
+Server -> Addon:  MBOT SELF_BOT_STATE~<token>~<status>~<0|1>~<reason>
+Addon  -> Server: MBOT RUN~SELF_BOT~<token>~<ENABLE|DISABLE>
+Server -> Addon:  MBOT SELF_BOT_RESULT~<token>~<status>~<0|1>~<reason>
+
+Addon  -> Server: MBOT GET~SELF_STRATEGY_STATE~<token>
+Server -> Addon:  framed STATE_BEGIN / STATE_ITEM / STATE_END packets for the active SelfBot
+Addon  -> Server: MBOT RUN~SELF_STRATEGY~<token>~<C|N>~<encodedChanges>
+Server -> Addon:  MBOT SELF_STRATEGY_ACK~<token>~<C|N>~<OK|ERR>~<reason>
+
+Addon  -> Server: MBOT RUN~SELF_ACTION~<token>~<AUTOGEAR|MAINTENANCE|WAIT_ATTACK_TIME>~<argument>
+Server -> Addon:  MBOT SELF_ACTION_ACK~<token>~<action>~<OK|ERR>~<reason>
+
 Addon  -> Server: MBOT GET~WEAPON_ENCHANT~<botName>~<token>
 Server -> Addon:  MBOT WEAPON_ENCHANT~<token>~<botName>~<status>~<mhItem>~<mhEnchant>~<mhDuration>~<ohItem>~<ohEnchant>~<ohDuration>
 
@@ -362,7 +375,7 @@ Addon  -> Server: MBOT RUN~ENCHANT_TRADE~<botName>~<token>~<spellId>
 Server -> Addon:  MBOT ENCHANT_TRADE_RESULT~<botName>~<token>~<spellId>~<status>~<reason>~<accepted>
 ```
 
-Current capability negotiation includes `STATE_FRAMING_V1`, `STRATEGY_MUTATION_V1`, `OUTFIT_V1`, `INVENTORY_V1`, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_DESTROY_V1`, `ITEM_USE_V1`, `ITEM_SELL_SINGLE_V1`, `VENDOR_BUYBACK_V1`, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1` and `ENCHANT_TRADE_V1`.
+Current capability negotiation includes `STATE_FRAMING_V1`, `STRATEGY_MUTATION_V1`, `OUTFIT_V1`, `INVENTORY_V1`, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_DESTROY_V1`, `ITEM_USE_V1`, `ITEM_SELL_SINGLE_V1`, `VENDOR_BUYBACK_V1`, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1`, `ENCHANT_TRADE_V1`, `SELF_BOT_V1`, `SELF_STRATEGY_V1` and `SELF_ACTION_V1`.
 
 The exact payloads are consumed internally by the MultiBot addon.
 
@@ -679,13 +692,15 @@ The endpoint and switching implementation remain present, while the project's fi
 
 # Current Development Baseline
 
-Documentation synchronized on **2026-08-17** against the validated Jellypowered bridge-first inventory work and pre-merge stabilization state.
+Documentation synchronized on **2026-08-20** against the post-merge Jellypowered + SelfBot baseline. The current Bridge development branch `jellypowered-chatless-integration-v2` was created directly from `main` and initially matched `main`, `origin/main` and its remote tracking branch at commit `d42b23dd288b6ff0871c57bedd98856b705594da` with 0/0 ahead-behind.
 
-Recent bridge-first milestones include `OUTFIT_V1`, `INVENTORY_V1`, hardened bank/guild-bank/vendor-buy item actions, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1`, the runtime-validated `ENCHANT_TRADE_V1` Enchanting Trade Service, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_USE_V1`, the specialized `ITEM_DESTROY` path, `ITEM_SELL_SINGLE_V1` and `VENDOR_BUYBACK_V1`.
+The Jellypowered bridge work is already merged into `main` through PR #28, merge commit `5e5ff7594ec8afedf40926605a60848dbc14991e`. Recent bridge-first milestones include `OUTFIT_V1`, `INVENTORY_V1`, hardened bank/guild-bank/vendor-buy item actions, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1`, the runtime-validated `ENCHANT_TRADE_V1` Enchanting Trade Service, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_USE_V1`, the specialized `ITEM_DESTROY` path, `ITEM_SELL_SINGLE_V1` and `VENDOR_BUYBACK_V1`.
 
-`INVENTORY_EXACT_V1` exposes exact Backpack, equipped-bag and Keyring topology for the bag-aware addon UI. Exact move/equip/unequip/use/single-sell and Buyback flows revalidate server-side state and wait for structured authoritative results; no generic Playerbots command/chat executor is exposed. Pre-merge stabilization has also closed CAPS wire-budget handling, whole-stack move and quest-start use postconditions, explicit INVENTORY_EXACT authorization, Equip fallback gating, inventory frame recycling, cold-cache safety, ITEM_USE/Inspect localization, the Buyback nil-frame guard and the unused `BUYBACK_ROWS` LuaLint warning. Global LuaLint/CI checks still remain to be executed before merge.
+`INVENTORY_EXACT_V1` exposes exact Backpack, equipped-bag and Keyring topology for the bag-aware addon UI. `ITEM_MOVE_V1` already supports whole-stack moves between allowed Backpack / Bag 1..4 / Keyring physical slots, including inter-container moves. It does **not** authorize the equipped bag slots themselves; any future `BAG_MOVE` work therefore concerns moving/re-equipping bag objects, not ordinary inventory items. No generic `ITEM_TRADE_V1` capability exists at this baseline: the current Inventory Trade workflow remains distinct from the specialized `ENCHANT_TRADE_V1` service. Exact move/equip/unequip/use/single-sell and Buyback flows revalidate server-side state and wait for structured authoritative results; no generic Playerbots command/chat executor is exposed.
 
-The next normal roadmap item remains **item-specific loot-rule add/remove**. Deferred work that must not interrupt that sequence includes the SELL_GREY/core-API follow-up and final Firestone/Spellstone TEMP_ENCHANT revalidation.
+The separate SelfBot work is also already merged into `main` through PR #30 **Complete SelfBot chatless bridge support**. The current bridge advertises `SELF_BOT_V1`, `SELF_STRATEGY_V1` and `SELF_ACTION_V1`. SelfBot residual findings such as `dps aoe` canonicalization and deferred Warlock rollback robustness remain outside the Jellypowered scope.
+
+The active Jellypowered v2 continuation should audit `ITEM_TRADE` first. Equipped-bag reassignment remains lower priority. After the remaining Jellypowered batch, the normal roadmap resumes with item-specific loot-rule add/remove. Deferred work that must not interrupt that sequence includes the SELL_GREY/core-API follow-up and final Firestone/Spellstone TEMP_ENCHANT revalidation.
 
 
 ---
@@ -945,3 +960,16 @@ bounded per-requester rate limit.
 The addon updates the SelfBot button from structured server responses. The
 historical `.playerbot bot self` chat command is used only when
 `MultiBot.allowLegacyChatFallback == true`.
+
+### SELF_STRATEGY_V1
+
+`SELF_STRATEGY_V1` is restricted to the requesting player's active SelfBot. `GET~SELF_STRATEGY_STATE` returns the SelfBot's current strategy state through the existing framed `STATE_BEGIN` / `STATE_ITEM` / `STATE_END` machinery. `RUN~SELF_STRATEGY` accepts only `C` or `N` state scope plus the shared strict strategy-mutation syntax, then applies a server-side class/state allowlist before mutating the SelfBot. Completion is returned through `SELF_STRATEGY_ACK`.
+
+This capability does not target arbitrary bots and does not expose arbitrary strategy names. The existing deferred Warlock stone switching guard remains part of this SelfBot strategy path; its separately identified rollback-hardening residual is not part of Jellypowered work.
+
+### SELF_ACTION_V1
+
+`SELF_ACTION_V1` is a narrow SelfBot-only action surface. The Bridge accepts only `AUTOGEAR`, `MAINTENANCE` and `WAIT_ATTACK_TIME`; `WAIT_ATTACK_TIME` accepts only `0`, `3`, `5` or `10`. Requests require an active SelfBot, PlayerbotAI/security checks and bounded rate limits, with heavier throttling for Autogear and Maintenance. Results are returned through `SELF_ACTION_ACK`.
+
+This capability does not make normal-bot Maintenance or Autogear paths chatless automatically. Those paths must continue to be classified/migrated independently where legacy chat is still present.
+
