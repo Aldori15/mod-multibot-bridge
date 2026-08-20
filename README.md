@@ -365,6 +365,12 @@ Server -> Addon:  MBOT INVENTORY_ITEM_EQUIP~<botName>~<token>~<status>~<reason>~
 Addon  -> Server: MBOT RUN~ITEM_UNEQUIP~<botName>~<token>~<srcSlot>~<srcItemId>
 Server -> Addon:  MBOT INVENTORY_ITEM_UNEQUIP~<botName>~<token>~<status>~<reason>~<srcSlot>~<srcItemId>
 
+Addon  -> Server: MBOT RUN~ITEM_TRADE~<botName>~<token>~<srcBag>~<srcSlot>~<srcItemId>~<srcCount>
+Server -> Addon:  MBOT INVENTORY_ITEM_TRADE~<botName>~<token>~<status>~<reason>~<srcBag>~<srcSlot>~<srcItemId>~<srcCount>
+
+Addon  -> Server: MBOT RUN~QUEST_ABANDON~<token>~<questId>
+Server -> Addon:  MBOT QUEST_ABANDON_RESULT~<token>~<questId>~<status>~<reason>~<matched>~<abandoned>
+
 Addon  -> Server: MBOT GET~ENCHANT_TRADE~<botName>~<token>
 Server -> Addon:  MBOT ENCHANT_TRADE_BEGIN~<botName>~<token>~<status>~<reason>~<skill>~<maxSkill>
 Server -> Addon:  MBOT ENCHANT_TRADE_ITEM~<botName>~<token>~<spellId>~<difficulty>~<available>~<hasTools>~<materialCount>
@@ -375,7 +381,7 @@ Addon  -> Server: MBOT RUN~ENCHANT_TRADE~<botName>~<token>~<spellId>
 Server -> Addon:  MBOT ENCHANT_TRADE_RESULT~<botName>~<token>~<spellId>~<status>~<reason>~<accepted>
 ```
 
-Current capability negotiation includes `STATE_FRAMING_V1`, `STRATEGY_MUTATION_V1`, `OUTFIT_V1`, `INVENTORY_V1`, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_DESTROY_V1`, `ITEM_USE_V1`, `ITEM_SELL_SINGLE_V1`, `VENDOR_BUYBACK_V1`, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1`, `ENCHANT_TRADE_V1`, `SELF_BOT_V1`, `SELF_STRATEGY_V1` and `SELF_ACTION_V1`.
+Current capability negotiation includes `STATE_FRAMING_V1`, `STRATEGY_MUTATION_V1`, `OUTFIT_V1`, `INVENTORY_V1`, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_TRADE_V1`, `ITEM_DESTROY_V1`, `ITEM_USE_V1`, `ITEM_SELL_SINGLE_V1`, `VENDOR_BUYBACK_V1`, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1`, `ENCHANT_TRADE_V1`, `QUEST_ABANDON_V1`, `SELF_BOT_V1`, `SELF_STRATEGY_V1` and `SELF_ACTION_V1`.
 
 The exact payloads are consumed internally by the MultiBot addon.
 
@@ -406,6 +412,9 @@ The bridge enforces the following input rules before any endpoint is called:
 - `ITEM_UNEQUIP_V1` accepts only an exact equipment slot `0..18` plus positive `itemId`, revalidates Playerbots security, requester/bot sessions, world/alive state and source identity, and captures the source GUID before execution;
 - `ITEM_UNEQUIP_V1` is rate-limited to 8 requests per requester per 2-second window, rejects replayed tokens for 10 seconds, keeps at most 32 recent tokens per requester and bounds requester unequip state to 512 entries;
 - `ITEM_UNEQUIP_V1` uses `CMSG_AUTOSTORE_BAG_ITEM` through the native AzerothCore session handler and reports success only when the same GUID is found outside equipment in an allowed Backpack/Bag 1..4 position; it does not call Playerbots `UnequipAction`, `HandleCommand`, `DoSpecificAction` or a generic chat executor;
+- `ITEM_TRADE_V1` accepts an exact Backpack/Bag inventory source identity, revalidates requester/bot control and runtime Trade state, preserves the native WoW Trade workflow, uses AzerothCore's native trade item handler and returns a structured `INVENTORY_ITEM_TRADE` result; the specialized `ENCHANT_TRADE_V1` service remains separate;
+- `QUEST_ABANDON_V1` accepts only a positive numeric quest ID plus a validated request token, is rate-limited to 4 requests per requester per 2-second window, rejects replayed tokens for 10 seconds, keeps at most 32 recent tokens per requester and bounds requester state to 512 entries;
+- `QUEST_ABANDON_V1` scans only bridge-visible bots in the requester's actual group, revalidates Playerbots security plus session/world state, searches only `MAX_QUEST_LOG_SIZE` slots, invokes the typed `WorldPackets::Quest::QuestLogRemoveQuest` packet through the native session handler and verifies the quest slot postcondition before reporting `QUEST_ABANDON_RESULT`;
 - Group Roll item links are bounded to 160 characters and must contain a valid item-link marker before execution;
 - Group Roll requests are rate-limited per requester (4 requests per 2-second window in the current implementation), and execution is restricted to bridge-visible bots in the requester's actual party/raid with Playerbots security revalidation.
 - Enchant Trade list/run requests are rate-limited per requester (4 requests per 2-second window), require an exact controllable bot name and token, and accept only a positive numeric spell ID for execution.
@@ -517,6 +526,14 @@ should not be assumed to be generically fragmented by this capability.
   <tr>
     <td><code>RUN~ITEM_UNEQUIP</code> / <code>ITEM_UNEQUIP_V1</code></td>
     <td>Unequip one exact equipment slot/item identity through the native AzerothCore auto-store path, validate the same item GUID in an allowed inventory position after execution and return a structured <code>INVENTORY_ITEM_UNEQUIP</code> result.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~ITEM_TRADE</code> / <code>ITEM_TRADE_V1</code></td>
+    <td>Trade one exact inventory source through the native WoW Trade workflow after server-side control/source/runtime revalidation, using the native AzerothCore trade item handler and a structured <code>INVENTORY_ITEM_TRADE</code> result. This capability is distinct from <code>ENCHANT_TRADE_V1</code>.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~QUEST_ABANDON</code> / <code>QUEST_ABANDON_V1</code></td>
+    <td>Abandon one numeric quest ID for authorized bridge-visible bots in the requester's actual group, using bounded quest-slot lookup, the typed AzerothCore <code>QuestLogRemoveQuest</code> client packet, native session handling and a structured <code>QUEST_ABANDON_RESULT</code> response.</td>
   </tr>
   <tr>
     <td><code>RUN~ITEM_USE</code> / <code>ITEM_USE_V1</code></td>
@@ -694,13 +711,13 @@ The endpoint and switching implementation remain present, while the project's fi
 
 Documentation synchronized on **2026-08-20** against the post-merge Jellypowered + SelfBot baseline. The current Bridge development branch `jellypowered-chatless-integration-v2` was created directly from `main` and initially matched `main`, `origin/main` and its remote tracking branch at commit `d42b23dd288b6ff0871c57bedd98856b705594da` with 0/0 ahead-behind.
 
-The Jellypowered bridge work is already merged into `main` through PR #28, merge commit `5e5ff7594ec8afedf40926605a60848dbc14991e`. Recent bridge-first milestones include `OUTFIT_V1`, `INVENTORY_V1`, hardened bank/guild-bank/vendor-buy item actions, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1`, the runtime-validated `ENCHANT_TRADE_V1` Enchanting Trade Service, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_USE_V1`, the specialized `ITEM_DESTROY` path, `ITEM_SELL_SINGLE_V1` and `VENDOR_BUYBACK_V1`.
+The Jellypowered bridge work is already merged into `main` through PR #28, merge commit `5e5ff7594ec8afedf40926605a60848dbc14991e`. Recent bridge-first milestones include `OUTFIT_V1`, `INVENTORY_V1`, hardened bank/guild-bank/vendor-buy item actions, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1`, the runtime-validated `ENCHANT_TRADE_V1` Enchanting Trade Service, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_TRADE_V1`, `ITEM_USE_V1`, the specialized `ITEM_DESTROY` path, `ITEM_SELL_SINGLE_V1`, `VENDOR_BUYBACK_V1` and `QUEST_ABANDON_V1`.
 
-`INVENTORY_EXACT_V1` exposes exact Backpack, equipped-bag and Keyring topology for the bag-aware addon UI. `ITEM_MOVE_V1` already supports whole-stack moves between allowed Backpack / Bag 1..4 / Keyring physical slots, including inter-container moves. It does **not** authorize the equipped bag slots themselves; any future `BAG_MOVE` work therefore concerns moving/re-equipping bag objects, not ordinary inventory items. No generic `ITEM_TRADE_V1` capability exists at this baseline: the current Inventory Trade workflow remains distinct from the specialized `ENCHANT_TRADE_V1` service. Exact move/equip/unequip/use/single-sell and Buyback flows revalidate server-side state and wait for structured authoritative results; no generic Playerbots command/chat executor is exposed.
+`INVENTORY_EXACT_V1` exposes exact Backpack, equipped-bag and Keyring topology for the bag-aware addon UI. `ITEM_MOVE_V1` already supports whole-stack moves between allowed Backpack / Bag 1..4 / Keyring physical slots, including inter-container moves. It does **not** authorize the equipped bag slots themselves; any future `BAG_MOVE` work therefore concerns moving/re-equipping bag objects, not ordinary inventory items. `ITEM_TRADE_V1` now provides generic exact-item Trade through the native WoW Trade flow and was runtime validated in both directions; it remains distinct from the specialized `ENCHANT_TRADE_V1` service. `QUEST_ABANDON_V1` uses the typed AzerothCore Quest packet/session path and was runtime validated with one controlled bot with no chat spam; the mixed multi-bot runtime case is explicitly deferred until suitable bots are available. Quest sharing remains a native client behavior through `QuestLogPushQuest()` and therefore does not require a `QUEST_SHARE_V1` bridge capability. Exact move/equip/unequip/trade/use/single-sell/Buyback/quest-abandon flows revalidate server-side state and wait for structured authoritative results; no generic Playerbots command/chat executor is exposed.
 
 The separate SelfBot work is also already merged into `main` through PR #30 **Complete SelfBot chatless bridge support**. The current bridge advertises `SELF_BOT_V1`, `SELF_STRATEGY_V1` and `SELF_ACTION_V1`. SelfBot residual findings such as `dps aoe` canonicalization and deferred Warlock rollback robustness remain outside the Jellypowered scope.
 
-The active Jellypowered v2 continuation should audit `ITEM_TRADE` first. Equipped-bag reassignment remains lower priority. After the remaining Jellypowered batch, the normal roadmap resumes with item-specific loot-rule add/remove. Deferred work that must not interrupt that sequence includes the SELL_GREY/core-API follow-up and final Firestone/Spellstone TEMP_ENCHANT revalidation.
+The active Jellypowered v2 continuation should audit `TALENT_APPLY` next. Equipped-bag reassignment remains a low-priority residual. After the remaining Jellypowered batch, the normal roadmap resumes with item-specific loot-rule add/remove. Deferred work that must not interrupt that sequence includes the SELL_GREY/core-API follow-up and final Firestone/Spellstone TEMP_ENCHANT revalidation.
 
 
 ---

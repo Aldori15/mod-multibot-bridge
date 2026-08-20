@@ -15,6 +15,7 @@
 #include "LootObjectStack.h"
 #include "ObjectMgr.h"
 #include "Player.h"
+#include "QuestPackets.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotAIConfig.h"
 #include "PlayerbotFactory.h"
@@ -121,6 +122,11 @@ std::chrono::milliseconds constexpr kVendorBuybackRateWindow(2000);
 std::chrono::seconds constexpr kVendorBuybackReplayTtl(10);
 std::size_t constexpr kVendorBuybackMaxRecentTokens = 32;
 std::size_t constexpr kVendorBuybackMaxRequesterStates = 512;
+std::size_t constexpr kQuestAbandonRateLimit = 4;
+std::chrono::milliseconds constexpr kQuestAbandonRateWindow(2000);
+std::chrono::seconds constexpr kQuestAbandonReplayTtl(10);
+std::size_t constexpr kQuestAbandonMaxRecentTokens = 32;
+std::size_t constexpr kQuestAbandonMaxRequesterStates = 512;
 std::size_t constexpr kGroupRollRateLimit = 4;
 std::chrono::milliseconds constexpr kGroupRollRateWindow(2000);
 std::size_t constexpr kSelfBotRateLimit = 8;
@@ -151,6 +157,7 @@ char const* const kInventoryItemSellCapability = "ITEM_SELL_SINGLE_V1";
 char const* const kVendorBuybackCapability = "VENDOR_BUYBACK_V1";
 char const* const kInventoryBulkSellCapability = "INVENTORY_BULK_SELL_V1";
 char const* const kInventoryOpenCapability = "INVENTORY_OPEN_V1";
+char const* const kQuestAbandonCapability = "QUEST_ABANDON_V1";
 char const* const kGroupRollCapability = "GROUP_ROLL_V1";
 char const* const kEnchantTradeCapability = "ENCHANT_TRADE_V1";
 char const* const kSelfBotCapability = "SELF_BOT_V1";
@@ -196,6 +203,7 @@ void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::
 void SendEnchantTradePackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void RunEnchantTradeCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& spellIdValue);
 void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue);
+void RunQuestAbandonCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, uint32 questId);
 void RunGroupRollCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& modeValue, std::string const& encodedItemLink);
 void RunFormationCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedFormation);
 void SendFormationPackets(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken);
@@ -257,6 +265,7 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kVendorBuybackCapability,
         kInventoryBulkSellCapability,
         kInventoryOpenCapability,
+        kQuestAbandonCapability,
         kGroupRollCapability,
         kEnchantTradeCapability,
         kSelfBotCapability,
@@ -5483,6 +5492,163 @@ bool ConsumeItemActionRateLimit(Player* requester)
     return true;
 }
 
+// MB_QUEST_ABANDON_V1_BEGIN
+struct QuestAbandonRateState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+    std::deque<std::pair<std::string, std::chrono::steady_clock::time_point>> recentTokens;
+};
+
+std::map<std::string, QuestAbandonRateState> sQuestAbandonRateStates;
+
+bool ConsumeQuestAbandonRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+    QuestAbandonRateState& state = sQuestAbandonRateStates[key];
+
+    while (!state.requests.empty() && now - state.requests.front() >= kQuestAbandonRateWindow)
+        state.requests.pop_front();
+
+    if (state.requests.size() >= kQuestAbandonRateLimit)
+        return false;
+
+    state.requests.push_back(now);
+
+    if (sQuestAbandonRateStates.size() > kQuestAbandonMaxRequesterStates)
+    {
+        for (auto it = sQuestAbandonRateStates.begin(); it != sQuestAbandonRateStates.end();)
+        {
+            while (!it->second.requests.empty() && now - it->second.requests.front() >= kQuestAbandonRateWindow)
+                it->second.requests.pop_front();
+            while (!it->second.recentTokens.empty() && now - it->second.recentTokens.front().second >= kQuestAbandonReplayTtl)
+                it->second.recentTokens.pop_front();
+
+            if (it->second.requests.empty() && it->second.recentTokens.empty() && it->first != key)
+                it = sQuestAbandonRateStates.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    return true;
+}
+
+bool RegisterQuestAbandonToken(Player* requester, std::string const& token)
+{
+    if (!requester || !IsValidRequestToken(token))
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+    QuestAbandonRateState& state = sQuestAbandonRateStates[key];
+
+    while (!state.recentTokens.empty() && now - state.recentTokens.front().second >= kQuestAbandonReplayTtl)
+        state.recentTokens.pop_front();
+
+    for (auto const& entry : state.recentTokens)
+        if (entry.first == token)
+            return false;
+
+    state.recentTokens.push_back({token, now});
+    while (state.recentTokens.size() > kQuestAbandonMaxRecentTokens)
+        state.recentTokens.pop_front();
+
+    return true;
+}
+
+void RunQuestAbandonCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    uint32 questId)
+{
+    std::string const token = Trim(requestToken);
+    std::string reason = "OK";
+    uint32 matched = 0;
+    uint32 foundQuest = 0;
+    uint32 abandoned = 0;
+
+    if (!requester || !requester->GetSession() || !questId)
+        reason = "BAD_REQUEST";
+    else if (!ConsumeQuestAbandonRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else if (!RegisterQuestAbandonToken(requester, token))
+        reason = "DUPLICATE";
+    else
+    {
+        Group* const group = requester->GetGroup();
+        if (!group)
+            reason = "NO_GROUP";
+        else
+        {
+            uint32 authorized = 0;
+            for (Player* const bot : GetBridgeVisibleBots(requester))
+            {
+                if (!bot || bot->GetGroup() != group)
+                    continue;
+
+                ++matched;
+                PlayerbotAI* const botAI = GetBotAI(bot);
+                if (!botAI || !botAI->GetSecurity() ||
+                    !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+                    continue;
+
+                ++authorized;
+                if (!bot->GetSession() || !bot->IsInWorld())
+                    continue;
+
+                uint8 questSlot = MAX_QUEST_LOG_SIZE;
+                for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+                {
+                    if (bot->GetQuestSlotQuestId(slot) == questId)
+                    {
+                        questSlot = slot;
+                        break;
+                    }
+                }
+
+                if (questSlot >= MAX_QUEST_LOG_SIZE)
+                    continue;
+
+                ++foundQuest;
+                WorldPacket packet(CMSG_QUESTLOG_REMOVE_QUEST, 1);
+                packet << questSlot;
+
+                WorldPackets::Quest::QuestLogRemoveQuest removeQuestPacket(std::move(packet));
+                removeQuestPacket.Read();
+                bot->GetSession()->HandleQuestLogRemoveQuest(removeQuestPacket);
+
+                if (bot->GetQuestSlotQuestId(questSlot) != questId)
+                    ++abandoned;
+            }
+
+            if (!matched)
+                reason = "NO_BOTS";
+            else if (!authorized)
+                reason = "FORBIDDEN";
+            else if (!foundQuest)
+                reason = "NO_QUEST";
+            else if (abandoned != foundQuest)
+                reason = "FAILED";
+        }
+    }
+
+    std::string const status = reason == "OK" ? "OK" : "ERR";
+    std::ostringstream payload;
+    payload << token
+        << kFieldSeparator << questId
+        << kFieldSeparator << status
+        << kFieldSeparator << UrlEncodeField(reason)
+        << kFieldSeparator << matched
+        << kFieldSeparator << abandoned;
+
+    SendAddonPacket(requester, replyType, "QUEST_ABANDON_RESULT", payload.str());
+}
+// MB_QUEST_ABANDON_V1_END
 struct GroupRollRateState
 {
     std::deque<std::chrono::steady_clock::time_point> requests;
@@ -10543,6 +10709,22 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         return true;
     }
 
+    if (requestType == "QUEST_ABANDON")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 3)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        uint32 questId = 0;
+        if (!TryParseUint32Field(fields[2], 1, std::numeric_limits<uint32>::max(), questId))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_NUMBER");
+
+        RunQuestAbandonCommand(player, replyType, fields[1], questId);
+        return true;
+    }
     if (requestType == "GROUP_ROLL")
     {
         std::string const token = GetSafeErrorToken(fields, 1);
