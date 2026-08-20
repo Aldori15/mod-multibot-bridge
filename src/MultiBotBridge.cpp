@@ -120,6 +120,8 @@ std::chrono::milliseconds constexpr kGroupRollRateWindow(2000);
 std::size_t constexpr kSelfBotRateLimit = 8;
 std::chrono::milliseconds constexpr kSelfBotRateWindow(2000);
 std::size_t constexpr kSelfBotMaxRequesterStates = 512;
+std::chrono::seconds constexpr kSelfBotHeavyActionRateWindow(10);
+std::size_t constexpr kSelfBotHeavyActionMaxRequesterStates = 512;
 std::size_t constexpr kWarlockStoneSwitchMaxPending = 512;
 std::size_t constexpr kWarlockStoneSwitchMaxApplyAttempts = 20;
 std::chrono::milliseconds constexpr kWarlockStoneSwitchApplyRetryDelay(100);
@@ -170,6 +172,7 @@ bool BridgeConsoleLogsEnabled()
 Player* FindBotByName(Player* player, std::string const& botName);
 PlayerbotAI* GetBotAI(Player* bot);
 bool ConsumeSelfBotRequestRateLimit(Player* requester);
+bool ConsumeSelfBotHeavyActionRateLimit(Player* requester);
 std::vector<Player*> GetBridgeVisibleBots(Player* player);
 void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload = "");
 bool SendStateAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload);
@@ -8099,6 +8102,19 @@ DeferredWarlockStoneStartResult TryBeginDeferredSelfWarlockStoneSwitch(
         return DeferredWarlockStoneStartResult::Failed;
     }
 
+    std::string const key = requester->GetName();
+    if (sPendingWarlockStoneSwitches.find(key) != sPendingWarlockStoneSwitches.end())
+    {
+        for (StrategyMutationOperation const& operation : operations)
+        {
+            if (operation.name == "firestone" || operation.name == "spellstone")
+            {
+                failureReason = "STONE_SWITCH_PENDING";
+                return DeferredWarlockStoneStartResult::Failed;
+            }
+        }
+    }
+
     bool hadFirestoneStrategy = false;
     bool hadSpellstoneStrategy = false;
     std::string desiredStone;
@@ -8130,13 +8146,6 @@ DeferredWarlockStoneStartResult TryBeginDeferredSelfWarlockStoneSwitch(
     if (requester->IsInCombat())
     {
         failureReason = "STONE_COMBAT";
-        return DeferredWarlockStoneStartResult::Failed;
-    }
-
-    std::string const key = requester->GetName();
-    if (sPendingWarlockStoneSwitches.find(key) != sPendingWarlockStoneSwitches.end())
-    {
-        failureReason = "STONE_SWITCH_PENDING";
         return DeferredWarlockStoneStartResult::Failed;
     }
 
@@ -8471,6 +8480,9 @@ void RunSelfActionCommand(
     else if (!IsSelfBot(requester))
         reason = "NOT_SELF_BOT";
     else if (!ConsumeSelfBotRequestRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else if ((action == "AUTOGEAR" || action == "MAINTENANCE") &&
+             !ConsumeSelfBotHeavyActionRateLimit(requester))
         reason = "RATE_LIMIT";
     else
     {
@@ -9626,6 +9638,44 @@ bool ConsumeSelfBotRequestRateLimit(Player* requester)
         return false;
 
     attempts.push_back(now);
+    return true;
+}
+
+std::map<uint32, SelfBotRateClock::time_point> gSelfBotHeavyActionRateStates;
+
+bool ConsumeSelfBotHeavyActionRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    SelfBotRateClock::time_point const now = SelfBotRateClock::now();
+    uint32 const requesterKey = requester->GetGUID().GetCounter();
+
+    auto existingIt = gSelfBotHeavyActionRateStates.find(requesterKey);
+    if (existingIt != gSelfBotHeavyActionRateStates.end())
+    {
+        if (now - existingIt->second < kSelfBotHeavyActionRateWindow)
+            return false;
+
+        gSelfBotHeavyActionRateStates.erase(existingIt);
+    }
+
+    if (gSelfBotHeavyActionRateStates.size() >= kSelfBotHeavyActionMaxRequesterStates)
+    {
+        for (auto stateIt = gSelfBotHeavyActionRateStates.begin();
+             stateIt != gSelfBotHeavyActionRateStates.end();)
+        {
+            if (now - stateIt->second >= kSelfBotHeavyActionRateWindow)
+                stateIt = gSelfBotHeavyActionRateStates.erase(stateIt);
+            else
+                ++stateIt;
+        }
+    }
+
+    if (gSelfBotHeavyActionRateStates.size() >= kSelfBotHeavyActionMaxRequesterStates)
+        return false;
+
+    gSelfBotHeavyActionRateStates[requesterKey] = now;
     return true;
 }
 
