@@ -17,6 +17,7 @@
 #include "Player.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotAIConfig.h"
+#include "PlayerbotFactory.h"
 #include "PlayerbotMgr.h"
 #include "PlayerbotRepository.h"
 #include "Playerbots.h"
@@ -24,6 +25,7 @@
 #include "ReputationMgr.h"
 #include "AiObjectContext.h"
 #include "Event.h"
+#include "EventProcessor.h"
 #include "Trigger.h"
 #include "Formations.h"
 #include "ScriptedGossip.h"
@@ -118,6 +120,12 @@ std::chrono::milliseconds constexpr kGroupRollRateWindow(2000);
 std::size_t constexpr kSelfBotRateLimit = 8;
 std::chrono::milliseconds constexpr kSelfBotRateWindow(2000);
 std::size_t constexpr kSelfBotMaxRequesterStates = 512;
+std::chrono::seconds constexpr kSelfBotHeavyActionRateWindow(10);
+std::size_t constexpr kSelfBotHeavyActionMaxRequesterStates = 512;
+std::size_t constexpr kWarlockStoneSwitchMaxPending = 512;
+std::size_t constexpr kWarlockStoneSwitchMaxApplyAttempts = 20;
+std::chrono::milliseconds constexpr kWarlockStoneSwitchApplyRetryDelay(100);
+std::chrono::milliseconds constexpr kWarlockStoneSwitchCreateTimeout(7000);
 std::size_t constexpr kEnchantTradeRateLimit = 4;
 std::chrono::milliseconds constexpr kEnchantTradeRateWindow(2000);
 std::size_t constexpr kMaxEnchantTradeEntries = 256;
@@ -139,6 +147,8 @@ char const* const kInventoryOpenCapability = "INVENTORY_OPEN_V1";
 char const* const kGroupRollCapability = "GROUP_ROLL_V1";
 char const* const kEnchantTradeCapability = "ENCHANT_TRADE_V1";
 char const* const kSelfBotCapability = "SELF_BOT_V1";
+char const* const kSelfStrategyCapability = "SELF_STRATEGY_V1";
+char const* const kSelfActionCapability = "SELF_ACTION_V1";
 uint32 constexpr kMaxItemActionCount = 1000;
 uint32 constexpr kMaxInventoryItemMoveCount = 1000;
 uint32 constexpr kMaxInventoryItemEquipCount = 1000;
@@ -161,6 +171,8 @@ bool BridgeConsoleLogsEnabled()
 
 Player* FindBotByName(Player* player, std::string const& botName);
 PlayerbotAI* GetBotAI(Player* bot);
+bool ConsumeSelfBotRequestRateLimit(Player* requester);
+bool ConsumeSelfBotHeavyActionRateLimit(Player* requester);
 std::vector<Player*> GetBridgeVisibleBots(Player* player);
 void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload = "");
 bool SendStateAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload);
@@ -237,7 +249,9 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kInventoryOpenCapability,
         kGroupRollCapability,
         kEnchantTradeCapability,
-        kSelfBotCapability
+        kSelfBotCapability,
+        kSelfStrategyCapability,
+        kSelfActionCapability
     };
 
     std::vector<std::string> chunks;
@@ -7746,6 +7760,936 @@ void RunStrategyMutationCommand(
         reason);
 }
 
+void SendSelfStrategyAck(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& stateScope,
+    std::string const& status,
+    std::string const& reason)
+{
+    std::ostringstream payload;
+    payload << requestToken
+        << kFieldSeparator << stateScope
+        << kFieldSeparator << status
+        << kFieldSeparator << UrlEncodeField(reason);
+
+    if (SendStateAddonPacket(requester, replyType, "SELF_STRATEGY_ACK", payload.str()))
+        return;
+
+    std::ostringstream fallbackPayload;
+    fallbackPayload << requestToken
+        << kFieldSeparator << stateScope
+        << kFieldSeparator << "ERR"
+        << kFieldSeparator << "ACK_TOO_LONG";
+    SendStateAddonPacket(requester, replyType, "SELF_STRATEGY_ACK", fallbackPayload.str());
+}
+
+enum class DeferredWarlockStoneStartResult
+{
+    NotApplicable,
+    Started,
+    Failed
+};
+
+struct PendingWarlockStoneSwitch
+{
+    std::string token;
+    std::string stateScope;
+    ChatMsg replyType = CHAT_MSG_WHISPER;
+    std::string desiredStone;
+    std::map<std::string, bool> priorStrategyStates;
+    bool hadFirestoneStrategy = false;
+    bool hadSpellstoneStrategy = false;
+    std::size_t applyAttempts = 0;
+    bool completionScheduled = false;
+};
+
+std::map<std::string, PendingWarlockStoneSwitch> sPendingWarlockStoneSwitches;
+
+bool HasNamedWarlockStoneItem(PlayerbotAI* botAI, std::string const& stoneName)
+{
+    if (!botAI || !botAI->GetAiObjectContext())
+        return false;
+
+    std::vector<Item*> const items =
+        botAI->GetAiObjectContext()->GetValue<std::vector<Item*>>("inventory items", stoneName)->Get();
+    return !items.empty();
+}
+
+bool IsTemporaryWeaponEnchantItem(Item* item)
+{
+    if (!item)
+        return false;
+
+    std::set<uint32> enchantIds;
+    CollectCarriedWarlockStoneEnchantIds(item, enchantIds);
+    return !enchantIds.empty();
+}
+
+bool TryGetRequestedWarlockStoneSwitch(
+    PlayerbotAI* botAI,
+    std::vector<StrategyMutationOperation> const& operations,
+    bool& hadFirestoneStrategy,
+    bool& hadSpellstoneStrategy,
+    std::string& desiredStone)
+{
+    desiredStone.clear();
+    if (!botAI)
+        return false;
+
+    hadFirestoneStrategy = botAI->HasStrategy("firestone", BOT_STATE_NON_COMBAT);
+    hadSpellstoneStrategy = botAI->HasStrategy("spellstone", BOT_STATE_NON_COMBAT);
+
+    bool hasFirestoneStrategy = hadFirestoneStrategy;
+    bool hasSpellstoneStrategy = hadSpellstoneStrategy;
+
+    for (StrategyMutationOperation const& operation : operations)
+    {
+        if (operation.name == "firestone")
+            hasFirestoneStrategy = operation.enable;
+        else if (operation.name == "spellstone")
+            hasSpellstoneStrategy = operation.enable;
+    }
+
+    if (!hadFirestoneStrategy && hadSpellstoneStrategy && hasFirestoneStrategy && !hasSpellstoneStrategy)
+        desiredStone = "firestone";
+    else if (hadFirestoneStrategy && !hadSpellstoneStrategy && !hasFirestoneStrategy && hasSpellstoneStrategy)
+        desiredStone = "spellstone";
+
+    return !desiredStone.empty();
+}
+
+bool RollbackPendingWarlockStoneStrategies(Player* player, PendingWarlockStoneSwitch const& pending)
+{
+    if (!player)
+        return false;
+
+    PlayerbotAI* const botAI = GetBotAI(player);
+    if (!botAI)
+        return false;
+
+    return RollbackNativeStrategyMutation(
+        player,
+        botAI,
+        "nc",
+        BOT_STATE_NON_COMBAT,
+        pending.priorStrategyStates);
+}
+
+void FinishPendingWarlockStoneSwitch(
+    Player* player,
+    std::string const& key,
+    std::string const& token,
+    bool success,
+    std::string const& reason)
+{
+    auto const pendingIt = sPendingWarlockStoneSwitches.find(key);
+    if (pendingIt == sPendingWarlockStoneSwitches.end() || pendingIt->second.token != token)
+        return;
+
+    PendingWarlockStoneSwitch const pending = pendingIt->second;
+
+    if (!success)
+    {
+        bool const rollbackSucceeded = RollbackPendingWarlockStoneStrategies(player, pending);
+        if (BridgeConsoleLogsEnabled())
+        {
+            LOG_INFO(
+                "playerbots",
+                "MultiBotBridge deferred warlock stone strategy rollback player={} requested={} reason={} succeeded={}",
+                player ? player->GetName() : key,
+                pending.desiredStone,
+                reason,
+                rollbackSucceeded);
+        }
+    }
+
+    sPendingWarlockStoneSwitches.erase(pendingIt);
+
+    if (player && player->GetSession())
+    {
+        SendSelfStrategyAck(
+            player,
+            pending.replyType,
+            pending.token,
+            pending.stateScope,
+            success ? "OK" : "ERR",
+            success ? "APPLIED" : reason);
+    }
+}
+
+void SchedulePendingWarlockStoneCompletion(Player* player, std::string const& key, std::string const& token);
+
+void CompletePendingWarlockStoneSwitch(Player* player, std::string const& key, std::string const& token)
+{
+    auto pendingIt = sPendingWarlockStoneSwitches.find(key);
+    if (pendingIt == sPendingWarlockStoneSwitches.end() || pendingIt->second.token != token)
+        return;
+
+    PendingWarlockStoneSwitch& pending = pendingIt->second;
+    ++pending.applyAttempts;
+
+    if (!player || !player->GetSession() || !IsSelfBot(player) || player->getClass() != CLASS_WARLOCK)
+    {
+        FinishPendingWarlockStoneSwitch(player, key, token, false, "STONE_STATE_INVALID");
+        return;
+    }
+
+    PlayerbotAI* const botAI = GetBotAI(player);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, player))
+    {
+        FinishPendingWarlockStoneSwitch(player, key, token, false, "STONE_NO_AI");
+        return;
+    }
+
+    if (player->IsInCombat())
+    {
+        FinishPendingWarlockStoneSwitch(player, key, token, false, "STONE_COMBAT");
+        return;
+    }
+
+    if (player->IsNonMeleeSpellCast(false) || !HasNamedWarlockStoneItem(botAI, pending.desiredStone))
+    {
+        if (pending.applyAttempts < kWarlockStoneSwitchMaxApplyAttempts)
+        {
+            SchedulePendingWarlockStoneCompletion(player, key, token);
+            return;
+        }
+
+        FinishPendingWarlockStoneSwitch(player, key, token, false, "STONE_ITEM_NOT_READY");
+        return;
+    }
+
+    WarlockStoneSwitchResult const result = TryForceWarlockStoneSwitch(
+        player,
+        player,
+        botAI,
+        BOT_STATE_NON_COMBAT,
+        pending.hadFirestoneStrategy,
+        pending.hadSpellstoneStrategy);
+
+    if (result == WarlockStoneSwitchResult::Applied)
+    {
+        if (BridgeConsoleLogsEnabled())
+        {
+            LOG_INFO(
+                "playerbots",
+                "MultiBotBridge deferred warlock stone switch applied player={} requested={} attempts={}",
+                player->GetName(),
+                pending.desiredStone,
+                pending.applyAttempts);
+        }
+
+        FinishPendingWarlockStoneSwitch(player, key, token, true, "APPLIED");
+        return;
+    }
+
+    FinishPendingWarlockStoneSwitch(player, key, token, false, "STONE_APPLY_FAILED");
+}
+
+void SchedulePendingWarlockStoneCompletion(Player* player, std::string const& key, std::string const& token)
+{
+    if (!player)
+        return;
+
+    player->m_Events.AddEventAtOffset(
+        [player, key, token]()
+        {
+            CompletePendingWarlockStoneSwitch(player, key, token);
+        },
+        kWarlockStoneSwitchApplyRetryDelay);
+}
+
+void TimeoutPendingWarlockStoneSwitch(Player* player, std::string const& key, std::string const& token)
+{
+    auto const pendingIt = sPendingWarlockStoneSwitches.find(key);
+    if (pendingIt == sPendingWarlockStoneSwitches.end() || pendingIt->second.token != token)
+        return;
+
+    if (BridgeConsoleLogsEnabled())
+    {
+        LOG_INFO(
+            "playerbots",
+            "MultiBotBridge deferred warlock stone switch timeout player={} requested={}",
+            player ? player->GetName() : key,
+            pendingIt->second.desiredStone);
+    }
+
+    FinishPendingWarlockStoneSwitch(player, key, token, false, "STONE_CREATE_TIMEOUT");
+}
+
+void NotifyPendingWarlockStoneItemCreated(Player* player, Item* item)
+{
+    if (!player || !item || !IsTemporaryWeaponEnchantItem(item))
+        return;
+
+    std::string const key = player->GetName();
+    auto pendingIt = sPendingWarlockStoneSwitches.find(key);
+    if (pendingIt == sPendingWarlockStoneSwitches.end() || pendingIt->second.completionScheduled)
+        return;
+
+    pendingIt->second.completionScheduled = true;
+
+    if (BridgeConsoleLogsEnabled())
+    {
+        LOG_INFO(
+            "playerbots",
+            "MultiBotBridge deferred warlock stone item created player={} requested={} itemEntry={}",
+            player->GetName(),
+            pendingIt->second.desiredStone,
+            item->GetEntry());
+    }
+
+    SchedulePendingWarlockStoneCompletion(player, key, pendingIt->second.token);
+}
+
+void CancelPendingWarlockStoneSwitch(Player* player, std::string const& reason, bool sendAck)
+{
+    if (!player)
+        return;
+
+    std::string const key = player->GetName();
+    auto const pendingIt = sPendingWarlockStoneSwitches.find(key);
+    if (pendingIt == sPendingWarlockStoneSwitches.end())
+        return;
+
+    PendingWarlockStoneSwitch const pending = pendingIt->second;
+    bool const rollbackSucceeded = RollbackPendingWarlockStoneStrategies(player, pending);
+    sPendingWarlockStoneSwitches.erase(pendingIt);
+
+    if (BridgeConsoleLogsEnabled())
+    {
+        LOG_INFO(
+            "playerbots",
+            "MultiBotBridge deferred warlock stone switch cancelled player={} requested={} reason={} rollback={}",
+            player->GetName(),
+            pending.desiredStone,
+            reason,
+            rollbackSucceeded);
+    }
+
+    if (sendAck && player->GetSession())
+    {
+        SendSelfStrategyAck(
+            player,
+            pending.replyType,
+            pending.token,
+            pending.stateScope,
+            "ERR",
+            reason);
+    }
+}
+
+DeferredWarlockStoneStartResult TryBeginDeferredSelfWarlockStoneSwitch(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& token,
+    std::string const& stateScope,
+    std::string const& normalizedChanges,
+    std::vector<StrategyMutationOperation> const& operations,
+    std::string& failureReason)
+{
+    if (!requester || stateScope != "N" || requester->getClass() != CLASS_WARLOCK)
+        return DeferredWarlockStoneStartResult::NotApplicable;
+
+    PlayerbotAI* const botAI = GetBotAI(requester);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+    {
+        failureReason = "STONE_NO_AI";
+        return DeferredWarlockStoneStartResult::Failed;
+    }
+
+    std::string const key = requester->GetName();
+    auto const existingPendingIt = sPendingWarlockStoneSwitches.find(key);
+    if (existingPendingIt != sPendingWarlockStoneSwitches.end())
+    {
+        PendingWarlockStoneSwitch const& pending = existingPendingIt->second;
+        for (StrategyMutationOperation const& operation : operations)
+        {
+            if (pending.priorStrategyStates.find(operation.name) != pending.priorStrategyStates.end())
+            {
+                failureReason = "STONE_SWITCH_PENDING";
+                return DeferredWarlockStoneStartResult::Failed;
+            }
+        }
+    }
+
+    bool hadFirestoneStrategy = false;
+    bool hadSpellstoneStrategy = false;
+    std::string desiredStone;
+    if (!TryGetRequestedWarlockStoneSwitch(
+        botAI,
+        operations,
+        hadFirestoneStrategy,
+        hadSpellstoneStrategy,
+        desiredStone))
+    {
+        return DeferredWarlockStoneStartResult::NotApplicable;
+    }
+
+    Item* const mainHand = requester->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+    if (!mainHand)
+        return DeferredWarlockStoneStartResult::NotApplicable;
+
+    uint32 const currentEnchantId = mainHand->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT);
+    if (!currentEnchantId)
+        return DeferredWarlockStoneStartResult::NotApplicable;
+
+    std::set<uint32> const carriedStoneEnchantIds = GetCarriedWarlockStoneEnchantIds(requester);
+    if (carriedStoneEnchantIds.find(currentEnchantId) == carriedStoneEnchantIds.end())
+        return DeferredWarlockStoneStartResult::NotApplicable;
+
+    if (HasNamedWarlockStoneItem(botAI, desiredStone))
+        return DeferredWarlockStoneStartResult::NotApplicable;
+
+    if (requester->IsInCombat())
+    {
+        failureReason = "STONE_COMBAT";
+        return DeferredWarlockStoneStartResult::Failed;
+    }
+
+    if (sPendingWarlockStoneSwitches.size() >= kWarlockStoneSwitchMaxPending)
+    {
+        failureReason = "STONE_PENDING_LIMIT";
+        return DeferredWarlockStoneStartResult::Failed;
+    }
+
+    std::map<std::string, bool> const priorStrategyStates =
+        CaptureStrategyMutationState(botAI, BOT_STATE_NON_COMBAT, operations);
+
+    if (!botAI->DoSpecificAction("nc", Event("nc", normalizedChanges, requester), true) ||
+        !VerifyStrategyMutationResult(botAI, BOT_STATE_NON_COMBAT, operations))
+    {
+        failureReason = "STONE_STRATEGY_FAILED";
+        return DeferredWarlockStoneStartResult::Failed;
+    }
+
+    PendingWarlockStoneSwitch pending;
+    pending.token = token;
+    pending.stateScope = stateScope;
+    pending.replyType = replyType;
+    pending.desiredStone = desiredStone;
+    pending.priorStrategyStates = priorStrategyStates;
+    pending.hadFirestoneStrategy = hadFirestoneStrategy;
+    pending.hadSpellstoneStrategy = hadSpellstoneStrategy;
+
+    sPendingWarlockStoneSwitches.emplace(key, pending);
+
+    requester->m_Events.AddEventAtOffset(
+        [requester, key, token]()
+        {
+            TimeoutPendingWarlockStoneSwitch(requester, key, token);
+        },
+        kWarlockStoneSwitchCreateTimeout);
+
+    std::string const createAction = "create " + desiredStone;
+    if (!botAI->DoSpecificAction(createAction, Event(), true))
+    {
+        PendingWarlockStoneSwitch const failedPending = sPendingWarlockStoneSwitches[key];
+        sPendingWarlockStoneSwitches.erase(key);
+        bool const rollbackSucceeded = RollbackPendingWarlockStoneStrategies(requester, failedPending);
+
+        if (BridgeConsoleLogsEnabled())
+        {
+            LOG_INFO(
+                "playerbots",
+                "MultiBotBridge deferred warlock stone create failed player={} requested={} rollback={}",
+                requester->GetName(),
+                desiredStone,
+                rollbackSucceeded);
+        }
+
+        failureReason = "STONE_CREATE_FAILED";
+        return DeferredWarlockStoneStartResult::Failed;
+    }
+
+    if (BridgeConsoleLogsEnabled())
+    {
+        LOG_INFO(
+            "playerbots",
+            "MultiBotBridge deferred warlock stone create started player={} requested={} token={}",
+            requester->GetName(),
+            desiredStone,
+            token);
+    }
+
+    return DeferredWarlockStoneStartResult::Started;
+}
+
+
+bool IsAllowedSelfCombatStrategyForClass(Player* requester, std::string const& name)
+{
+    if (name == "dps assist"
+        || name == "dps aoe"
+        || name == "tank assist"
+        || name == "avoid aoe"
+        || name == "save mana"
+        || name == "threat"
+        || name == "behind"
+        || name == "focus")
+    {
+        return true;
+    }
+
+    if (!requester)
+        return false;
+
+    switch (requester->getClass())
+    {
+        case CLASS_DEATH_KNIGHT:
+            return name == "blood"
+                || name == "frost"
+                || name == "frost aoe"
+                || name == "tank face"
+                || name == "unholy"
+                || name == "unholy aoe";
+        case CLASS_DRUID:
+            return name == "aoe"
+                || name == "balance"
+                || name == "bear"
+                || name == "cat"
+                || name == "healer dps"
+                || name == "offheal"
+                || name == "resto"
+                || name == "tank face";
+        case CLASS_HUNTER:
+            return name == "aoe"
+                || name == "bdps"
+                || name == "bm"
+                || name == "bspeed"
+                || name == "mm"
+                || name == "rnature"
+                || name == "surv"
+                || name == "trap weave";
+        case CLASS_MAGE:
+            return name == "aoe"
+                || name == "arcane"
+                || name == "fire"
+                || name == "firestarter"
+                || name == "frost"
+                || name == "frostfire";
+        case CLASS_PALADIN:
+            return name == "baoe"
+                || name == "barmor"
+                || name == "bcast"
+                || name == "bspeed"
+                || name == "dps"
+                || name == "heal"
+                || name == "healer dps"
+                || name == "offheal"
+                || name == "rfire"
+                || name == "rfrost"
+                || name == "rshadow"
+                || name == "tank"
+                || name == "tank face";
+        case CLASS_PRIEST:
+            return name == "heal"
+                || name == "healer dps"
+                || name == "holy dps"
+                || name == "holy heal"
+                || name == "shadow"
+                || name == "shadow aoe"
+                || name == "shadow debuff";
+        case CLASS_ROGUE:
+            return name == "boost"
+                || name == "dps"
+                || name == "stealthed";
+        case CLASS_SHAMAN:
+            return name == "aoe"
+                || name == "cleansing"
+                || name == "cure"
+                || name == "earthbind"
+                || name == "ele"
+                || name == "enh"
+                || name == "fire resistance"
+                || name == "flametongue"
+                || name == "frost resistance"
+                || name == "grounding"
+                || name == "healer dps"
+                || name == "healing stream"
+                || name == "magma"
+                || name == "mana spring"
+                || name == "nature resistance"
+                || name == "resto"
+                || name == "searing"
+                || name == "stoneskin"
+                || name == "strength of earth"
+                || name == "tremor"
+                || name == "windfury"
+                || name == "wrath"
+                || name == "wrath of air";
+        case CLASS_WARLOCK:
+            return name == "curse of agony"
+                || name == "curse of doom"
+                || name == "curse of elements"
+                || name == "curse of exhaustion"
+                || name == "curse of tongues"
+                || name == "curse of weakness"
+                || name == "meta melee"
+                || name == "tank";
+        case CLASS_WARRIOR:
+            return name == "tank"
+                || name == "tank face";
+        default:
+            return false;
+    }
+}
+
+bool IsAllowedSelfStrategyFoundationMutation(
+    Player* requester,
+    BotState botState,
+    std::vector<StrategyMutationOperation> const& operations,
+    std::string& reason)
+{
+    if (botState == BOT_STATE_NON_COMBAT)
+    {
+        for (StrategyMutationOperation const& operation : operations)
+        {
+            bool allowed = operation.name == "food"
+                || operation.name == "loot"
+                || operation.name == "gather"
+                || (operation.name == "mount" && !operation.enable);
+
+            if (!allowed && requester)
+            {
+                switch (requester->getClass())
+                {
+                    case CLASS_DRUID:
+                        allowed = operation.name == "buff";
+                        break;
+                    case CLASS_HUNTER:
+                        allowed = operation.name == "rnature"
+                            || operation.name == "bspeed"
+                            || operation.name == "bdps";
+                        break;
+                    case CLASS_MAGE:
+                        allowed = operation.name == "bmana"
+                            || operation.name == "bdps";
+                        break;
+                    case CLASS_PALADIN:
+                        allowed = operation.name == "bsanc"
+                            || operation.name == "bwisdom"
+                            || operation.name == "bkings"
+                            || operation.name == "bmight"
+                            || operation.name == "bspeed"
+                            || operation.name == "rfire"
+                            || operation.name == "rfrost"
+                            || operation.name == "rshadow"
+                            || operation.name == "baoe"
+                            || operation.name == "barmor"
+                            || operation.name == "bcast";
+                        break;
+                    case CLASS_PRIEST:
+                        allowed = operation.name == "buff"
+                            || operation.name == "rshadow";
+                        break;
+                    case CLASS_ROGUE:
+                        allowed = operation.name == "stealth";
+                        break;
+                    default:
+                        break;
+                }
+            }
+            if (!allowed && requester && requester->getClass() == CLASS_WARLOCK)
+            {
+                allowed = operation.name == "imp"
+                    || operation.name == "voidwalker"
+                    || operation.name == "succubus"
+                    || operation.name == "felhunter"
+                    || operation.name == "felguard"
+                    || operation.name == "ss self"
+                    || operation.name == "ss master"
+                    || operation.name == "ss tank"
+                    || operation.name == "ss healer"
+                    || operation.name == "spellstone"
+                    || operation.name == "firestone";
+            }
+
+            if (!allowed)
+            {
+                reason = "UNSUPPORTED_STRATEGY";
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    if (botState != BOT_STATE_COMBAT)
+    {
+        reason = "UNSUPPORTED_STATE";
+        return false;
+    }
+
+    for (StrategyMutationOperation const& operation : operations)
+    {
+        if (!IsAllowedSelfCombatStrategyForClass(requester, operation.name))
+        {
+            reason = "UNSUPPORTED_STRATEGY";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void SendSelfActionAck(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& action,
+    bool ok,
+    std::string const& reason)
+{
+    if (!requester)
+        return;
+
+    std::ostringstream payload;
+    payload << requestToken
+        << kFieldSeparator << action
+        << kFieldSeparator << (ok ? "OK" : "ERR")
+        << kFieldSeparator << UrlEncodeField(reason);
+
+    if (SendStateAddonPacket(requester, replyType, "SELF_ACTION_ACK", payload.str()))
+        return;
+
+    std::ostringstream fallbackPayload;
+    fallbackPayload << requestToken
+        << kFieldSeparator << action
+        << kFieldSeparator << "ERR"
+        << kFieldSeparator << "ACK_TOO_LONG";
+    SendStateAddonPacket(requester, replyType, "SELF_ACTION_ACK", fallbackPayload.str());
+}
+
+void RunSelfActionCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& actionValue,
+    std::string const& argumentValue)
+{
+    std::string const token = Trim(requestToken);
+    std::string const action = ToUpper(Trim(actionValue));
+    std::string const argument = Trim(argumentValue);
+    bool ok = false;
+    std::string reason = "BAD_REQUEST";
+
+    if (!requester || !requester->GetSession())
+        reason = "NO_SESSION";
+    else if (!IsSelfBot(requester))
+        reason = "NOT_SELF_BOT";
+    else if (!ConsumeSelfBotRequestRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else if ((action == "AUTOGEAR" || action == "MAINTENANCE") &&
+             !ConsumeSelfBotHeavyActionRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else
+    {
+        PlayerbotAI* const botAI = GetBotAI(requester);
+        if (!botAI)
+            reason = "NO_AI";
+        else if (!botAI->GetSecurity() ||
+                 !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+            reason = "FORBIDDEN";
+        else if (action == "WAIT_ATTACK_TIME")
+        {
+            if (argument != "0" && argument != "3" && argument != "5" && argument != "10")
+                reason = "BAD_ARGUMENT";
+            else if (!botAI->GetAiObjectContext())
+                reason = "NO_CONTEXT";
+            else
+            {
+                uint8 const value = static_cast<uint8>(std::strtoul(argument.c_str(), nullptr, 10));
+                botAI->GetAiObjectContext()->GetValue<uint8>("wait for attack time")->Set(value);
+                ok = true;
+                reason = "APPLIED";
+            }
+        }
+        else if (action == "AUTOGEAR")
+        {
+            if (!argument.empty())
+                reason = "BAD_ARGUMENT";
+            else if (!sPlayerbotAIConfig.autoGearCommand)
+                reason = "DISABLED";
+            else if (!sPlayerbotAIConfig.autoGearCommandAltBots &&
+                     !sPlayerbotAIConfig.IsInRandomAccountList(requester->GetSession()->GetAccountId()))
+                reason = "ALT_BOT_REFUSED";
+            else
+            {
+                uint32 const quality = static_cast<uint32>(sPlayerbotAIConfig.autoGearQualityLimit);
+                uint32 const ilvl = static_cast<uint32>(sPlayerbotAIConfig.autoGearScoreLimit);
+                PlayerbotFactory::AutoGear(requester, quality, ilvl, true);
+                ok = true;
+                reason = "APPLIED";
+            }
+        }
+        else if (action == "MAINTENANCE")
+        {
+            if (!argument.empty())
+                reason = "BAD_ARGUMENT";
+            else if (!sPlayerbotAIConfig.maintenanceCommand)
+                reason = "DISABLED";
+            else
+            {
+                PlayerbotFactory factory(requester, requester->GetLevel());
+
+                if (!botAI->IsAltBot())
+                {
+                    factory.InitAttunementQuests();
+                    factory.InitBags(false);
+                    factory.InitAmmo();
+                    factory.InitFood();
+                    factory.InitReagents();
+                    factory.InitConsumables();
+                    factory.InitPotions();
+                    factory.InitTalentsTree(true);
+                    factory.InitPet();
+                    factory.InitPetTalents();
+                    factory.InitSkills();
+                    factory.InitClassSpells();
+                    factory.InitAvailableSpells();
+                    factory.InitReputation();
+                    factory.InitSpecialSpells();
+                    factory.InitMounts();
+                    factory.InitGlyphs(false);
+                    factory.InitKeyring();
+                    if (requester->GetLevel() >= sPlayerbotAIConfig.minEnchantingBotLevel)
+                        factory.ApplyEnchantAndGemsNew();
+                }
+                else
+                {
+                    if (sPlayerbotAIConfig.altMaintenanceAttunementQs)
+                        factory.InitAttunementQuests();
+                    if (sPlayerbotAIConfig.altMaintenanceBags)
+                        factory.InitBags(false);
+                    if (sPlayerbotAIConfig.altMaintenanceAmmo)
+                        factory.InitAmmo();
+                    if (sPlayerbotAIConfig.altMaintenanceFood)
+                        factory.InitFood();
+                    if (sPlayerbotAIConfig.altMaintenanceReagents)
+                        factory.InitReagents();
+                    if (sPlayerbotAIConfig.altMaintenanceConsumables)
+                        factory.InitConsumables();
+                    if (sPlayerbotAIConfig.altMaintenancePotions)
+                        factory.InitPotions();
+                    if (sPlayerbotAIConfig.altMaintenanceTalentTree)
+                        factory.InitTalentsTree(true);
+                    if (sPlayerbotAIConfig.altMaintenancePet)
+                        factory.InitPet();
+                    if (sPlayerbotAIConfig.altMaintenancePetTalents)
+                        factory.InitPetTalents();
+                    if (sPlayerbotAIConfig.altMaintenanceSkills)
+                        factory.InitSkills();
+                    if (sPlayerbotAIConfig.altMaintenanceClassSpells)
+                        factory.InitClassSpells();
+                    if (sPlayerbotAIConfig.altMaintenanceAvailableSpells)
+                        factory.InitAvailableSpells();
+                    if (sPlayerbotAIConfig.altMaintenanceReputation)
+                        factory.InitReputation();
+                    if (sPlayerbotAIConfig.altMaintenanceSpecialSpells)
+                        factory.InitSpecialSpells();
+                    if (sPlayerbotAIConfig.altMaintenanceMounts)
+                        factory.InitMounts();
+                    if (sPlayerbotAIConfig.altMaintenanceGlyphs)
+                        factory.InitGlyphs(false);
+                    if (sPlayerbotAIConfig.altMaintenanceKeyring)
+                        factory.InitKeyring();
+                    if (sPlayerbotAIConfig.altMaintenanceGemsEnchants &&
+                        requester->GetLevel() >= sPlayerbotAIConfig.minEnchantingBotLevel)
+                        factory.ApplyEnchantAndGemsNew();
+                }
+
+                requester->DurabilityRepairAll(false, 1.0f, false);
+                requester->SendTalentsInfoData(false);
+                ok = true;
+                reason = "APPLIED";
+            }
+        }
+        else
+            reason = "UNSUPPORTED_ACTION";
+    }
+
+    SendSelfActionAck(requester, replyType, token, action, ok, reason);
+}
+void RunSelfStrategyMutationCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& stateScopeValue,
+    std::string const& encodedChanges)
+{
+    std::string const token = Trim(requestToken);
+    std::string const stateScope = ToUpper(Trim(stateScopeValue));
+    std::string status = "ERR";
+    std::string reason = "UNKNOWN";
+
+    if (!requester || !requester->GetSession())
+        reason = "NO_SESSION";
+    else if (stateScope != "C" && stateScope != "N")
+        reason = "BAD_STATE";
+    else
+    {
+        std::string rawChanges;
+        if (!TryUrlDecodeField(encodedChanges, rawChanges, kMaxCommandLength, false))
+            reason = "BAD_ENCODING";
+        else
+        {
+            std::string normalizedChanges;
+            std::vector<StrategyMutationOperation> operations;
+            if (!TryNormalizeStrategyChanges(rawChanges, normalizedChanges, operations, reason))
+            {
+                // reason already set by the shared strict normalizer.
+            }
+            else
+            {
+                BotState const botState = stateScope == "C" ? BOT_STATE_COMBAT : BOT_STATE_NON_COMBAT;
+                std::string const actionName = stateScope == "C" ? "co" : "nc";
+
+                if (!IsAllowedSelfStrategyFoundationMutation(requester, botState, operations, reason))
+                {
+                    // SelfBot mutations remain restricted by the state- and class-aware server allowlist.
+                }
+                else if (!ConsumeStrategyMutationRateLimit(requester))
+                    reason = "RATE_LIMIT";
+                else if (!IsSelfBot(requester))
+                    reason = "NOT_SELF_BOT";
+                else if (!GET_PLAYERBOT_AI(requester))
+                    reason = "NO_AI";
+                else
+                {
+                    std::string deferredFailureReason;
+                    DeferredWarlockStoneStartResult const deferredResult =
+                        TryBeginDeferredSelfWarlockStoneSwitch(
+                            requester,
+                            replyType,
+                            token,
+                            stateScope,
+                            normalizedChanges,
+                            operations,
+                            deferredFailureReason);
+
+                    if (deferredResult == DeferredWarlockStoneStartResult::Started)
+                        return;
+                    if (deferredResult == DeferredWarlockStoneStartResult::Failed)
+                        reason = deferredFailureReason.empty() ? "FAILED" : deferredFailureReason;
+                    else if (ApplyNativeStrategyMutation(
+                        requester, requester, actionName, botState, normalizedChanges, operations))
+                    {
+                        status = "OK";
+                        reason = "APPLIED";
+                    }
+                    else
+                        reason = "FAILED";
+                }
+            }
+        }
+    }
+
+    SendSelfStrategyAck(requester, replyType, token, stateScope, status, reason);
+}
 bool IsAllowedFormationName(std::string const& formation)
 {
     static std::set<std::string> const allowed =
@@ -8529,6 +9473,38 @@ void SendFramedStatePacket(Player* player, ChatMsg replyType, std::string const&
         SendStateAbort(player, replyType, token, bot->GetName(), "SEND_FAILED");
 }
 
+void SendSelfStrategyStatePacket(Player* player, ChatMsg replyType, std::string const& token)
+{
+    if (!player || !player->GetSession())
+    {
+        if (player)
+            SendStateAbort(player, replyType, token, player->GetName(), "NO_SESSION");
+        return;
+    }
+
+    if (!IsSelfBot(player))
+    {
+        SendStateAbort(player, replyType, token, player->GetName(), "NOT_SELF_BOT");
+        return;
+    }
+
+    if (!GET_PLAYERBOT_AI(player))
+    {
+        SendStateAbort(player, replyType, token, player->GetName(), "NO_AI");
+        return;
+    }
+
+    std::vector<std::pair<std::string, std::string>> packets;
+    std::string reason;
+    if (!AppendStateFramesForBot(packets, token, player, reason))
+    {
+        SendStateAbort(player, replyType, token, player->GetName(), reason);
+        return;
+    }
+
+    if (!SendPreparedStatePackets(player, replyType, packets))
+        SendStateAbort(player, replyType, token, player->GetName(), "SEND_FAILED");
+}
 void SendFramedStatePackets(Player* player, ChatMsg replyType, std::string const& token)
 {
     std::vector<Player*> const bots = GetBridgeVisibleBots(player);
@@ -8664,6 +9640,44 @@ bool ConsumeSelfBotRequestRateLimit(Player* requester)
         return false;
 
     attempts.push_back(now);
+    return true;
+}
+
+std::map<uint32, SelfBotRateClock::time_point> gSelfBotHeavyActionRateStates;
+
+bool ConsumeSelfBotHeavyActionRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    SelfBotRateClock::time_point const now = SelfBotRateClock::now();
+    uint32 const requesterKey = requester->GetGUID().GetCounter();
+
+    auto existingIt = gSelfBotHeavyActionRateStates.find(requesterKey);
+    if (existingIt != gSelfBotHeavyActionRateStates.end())
+    {
+        if (now - existingIt->second < kSelfBotHeavyActionRateWindow)
+            return false;
+
+        gSelfBotHeavyActionRateStates.erase(existingIt);
+    }
+
+    if (gSelfBotHeavyActionRateStates.size() >= kSelfBotHeavyActionMaxRequesterStates)
+    {
+        for (auto stateIt = gSelfBotHeavyActionRateStates.begin();
+             stateIt != gSelfBotHeavyActionRateStates.end();)
+        {
+            if (now - stateIt->second >= kSelfBotHeavyActionRateWindow)
+                stateIt = gSelfBotHeavyActionRateStates.erase(stateIt);
+            else
+                ++stateIt;
+        }
+    }
+
+    if (gSelfBotHeavyActionRateStates.size() >= kSelfBotHeavyActionMaxRequesterStates)
+        return false;
+
+    gSelfBotHeavyActionRateStates[requesterKey] = now;
     return true;
 }
 
@@ -8815,6 +9829,27 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
 
             SendSelfBotPacket(
                 player, replyType, "SELF_BOT_STATE", fields[1], "OK", "STATE");
+            return true;
+        }
+
+        if (requestType == "SELF_STRATEGY_STATE")
+        {
+            std::string const token = GetSafeErrorToken(fields, 1);
+            if (fields.size() != 2)
+                return SendProtocolError(
+                    player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+            if (!IsValidRequestToken(fields[1]))
+                return SendProtocolError(
+                    player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+            if (!ConsumeSelfBotRequestRateLimit(player))
+            {
+                SendStateAbort(player, replyType, fields[1], player ? player->GetName() : "", "RATE_LIMIT");
+                return true;
+            }
+
+            SendSelfStrategyStatePacket(player, replyType, fields[1]);
             return true;
         }
 
@@ -9159,6 +10194,51 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         }
 
         RunSelfBotCommand(player, replyType, fields[1], desiredState);
+        return true;
+    }
+
+    if (requestType == "SELF_ACTION")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 4)
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_TOKEN");
+
+        if (!IsValidProtocolName(fields[2], kMaxRequestTypeLength))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_ACTION");
+
+        if (!IsValidRawField(fields[3], 16, true))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_ARGUMENT");
+
+        RunSelfActionCommand(player, replyType, fields[1], fields[2], fields[3]);
+        return true;
+    }
+    if (requestType == "SELF_STRATEGY")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 4)
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        if (fields[2] != "C" && fields[2] != "N")
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_STATE");
+
+        if (!IsValidEncodedField(fields[3], kMaxCommandLength, false))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_ENCODING");
+
+        RunSelfStrategyMutationCommand(player, replyType, fields[1], fields[2], fields[3]);
         return true;
     }
 
@@ -9663,6 +10743,21 @@ public:
         }
 
         return HandleBridgeOpcode(player, replyType, packet.first, packet.second);
+    }
+
+    void OnPlayerCreateItem(Player* player, Item* item, uint32 /*count*/) override
+    {
+        NotifyPendingWarlockStoneItemCreated(player, item);
+    }
+
+    void OnPlayerBeforeLogout(Player* player) override
+    {
+        CancelPendingWarlockStoneSwitch(player, "STONE_LOGOUT", false);
+    }
+
+    void OnPlayerMapChanged(Player* player) override
+    {
+        CancelPendingWarlockStoneSwitch(player, "STONE_MAP_CHANGED", true);
     }
 
     bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Player* /*receiver*/) override
