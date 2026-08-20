@@ -37,6 +37,7 @@
 #include "Unit.h"
 #include "World.h"
 #include "WorldPacket.h"
+#include "WorldSession.h"
 
 #include <algorithm>
 #include <array>
@@ -85,6 +86,11 @@ std::chrono::milliseconds constexpr kInventoryItemMoveRateWindow(2000);
 std::chrono::seconds constexpr kInventoryItemMoveReplayTtl(10);
 std::size_t constexpr kInventoryItemMoveMaxRecentTokens = 32;
 std::size_t constexpr kInventoryItemMoveMaxRequesterStates = 512;
+std::size_t constexpr kInventoryItemTradeRateLimit = 8;
+std::chrono::milliseconds constexpr kInventoryItemTradeRateWindow(2000);
+std::chrono::seconds constexpr kInventoryItemTradeReplayTtl(10);
+std::size_t constexpr kInventoryItemTradeMaxRecentTokens = 32;
+std::size_t constexpr kInventoryItemTradeMaxRequesterStates = 512;
 std::size_t constexpr kInventoryItemEquipRateLimit = 8;
 std::chrono::milliseconds constexpr kInventoryItemEquipRateWindow(2000);
 std::chrono::seconds constexpr kInventoryItemEquipReplayTtl(10);
@@ -136,6 +142,7 @@ char const* const kOutfitCapability = "OUTFIT_V1";
 char const* const kInventoryCapability = "INVENTORY_V1";
 char const* const kInventoryExactCapability = "INVENTORY_EXACT_V1";
 char const* const kInventoryItemMoveCapability = "ITEM_MOVE_V1";
+char const* const kInventoryItemTradeCapability = "ITEM_TRADE_V1";
 char const* const kInventoryItemEquipCapability = "ITEM_EQUIP_V1";
 char const* const kInventoryItemUnequipCapability = "ITEM_UNEQUIP_V1";
 char const* const kInventoryItemDestroyCapability = "ITEM_DESTROY_V1";
@@ -151,6 +158,7 @@ char const* const kSelfStrategyCapability = "SELF_STRATEGY_V1";
 char const* const kSelfActionCapability = "SELF_ACTION_V1";
 uint32 constexpr kMaxItemActionCount = 1000;
 uint32 constexpr kMaxInventoryItemMoveCount = 1000;
+uint32 constexpr kMaxInventoryItemTradeCount = 1000;
 uint32 constexpr kMaxInventoryItemEquipCount = 1000;
 uint32 constexpr kMaxInventoryItemDestroyCount = 1000;
 uint32 constexpr kMaxInventoryItemUseCount = 1000;
@@ -180,6 +188,7 @@ bool SendProtocolError(Player* player, ChatMsg chatType, std::string const& opco
 void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void SendInventoryExactSnapshot(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void RunInventoryItemMoveCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint8 srcBag, uint8 srcSlot, uint32 srcItemId, uint32 srcCount, uint8 dstBag, uint8 dstSlot, uint32 dstItemId, uint32 dstCount);
+void RunInventoryItemTradeCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint8 srcBag, uint8 srcSlot, uint32 srcItemId, uint32 srcCount);
 void SendTrainerPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& encodedSuffix, std::string const& persistToken);
 void RunTrainerLearnCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& trainerEntryValue, std::string const& spellIdValue);
@@ -239,6 +248,7 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kInventoryCapability,
         kInventoryExactCapability,
         kInventoryItemMoveCapability,
+        kInventoryItemTradeCapability,
         kInventoryItemEquipCapability,
         kInventoryItemUnequipCapability,
         kInventoryItemDestroyCapability,
@@ -2500,6 +2510,88 @@ bool RegisterInventoryItemMoveToken(Player* requester, std::string const& token)
 
     state.recentTokens.push_back(std::make_pair(token, now));
     while (state.recentTokens.size() > kInventoryItemMoveMaxRecentTokens)
+        state.recentTokens.pop_front();
+    return true;
+}
+
+struct InventoryItemTradeRequestState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+    std::deque<std::pair<std::string, std::chrono::steady_clock::time_point>> recentTokens;
+};
+
+std::map<std::string, InventoryItemTradeRequestState> sInventoryItemTradeRequestStates;
+
+void PruneInventoryItemTradeRequestState(InventoryItemTradeRequestState& state, std::chrono::steady_clock::time_point const now)
+{
+    while (!state.requests.empty() && now - state.requests.front() >= kInventoryItemTradeRateWindow)
+        state.requests.pop_front();
+    while (!state.recentTokens.empty() && now - state.recentTokens.front().second >= kInventoryItemTradeReplayTtl)
+        state.recentTokens.pop_front();
+    while (state.recentTokens.size() > kInventoryItemTradeMaxRecentTokens)
+        state.recentTokens.pop_front();
+}
+
+bool ConsumeInventoryItemTradeRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+    auto stateIt = sInventoryItemTradeRequestStates.find(key);
+
+    if (stateIt == sInventoryItemTradeRequestStates.end())
+    {
+        if (sInventoryItemTradeRequestStates.size() >= kInventoryItemTradeMaxRequesterStates)
+        {
+            for (auto it = sInventoryItemTradeRequestStates.begin(); it != sInventoryItemTradeRequestStates.end();)
+            {
+                PruneInventoryItemTradeRequestState(it->second, now);
+                if (it->second.requests.empty() && it->second.recentTokens.empty())
+                    it = sInventoryItemTradeRequestStates.erase(it);
+                else
+                    ++it;
+            }
+        }
+
+        if (sInventoryItemTradeRequestStates.size() >= kInventoryItemTradeMaxRequesterStates)
+            return false;
+
+        stateIt = sInventoryItemTradeRequestStates.emplace(key, InventoryItemTradeRequestState()).first;
+    }
+
+    InventoryItemTradeRequestState& state = stateIt->second;
+    PruneInventoryItemTradeRequestState(state, now);
+
+    if (state.requests.size() >= kInventoryItemTradeRateLimit)
+        return false;
+
+    state.requests.push_back(now);
+    return true;
+}
+
+bool RegisterInventoryItemTradeToken(Player* requester, std::string const& token)
+{
+    if (!requester || token.empty())
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    auto stateIt = sInventoryItemTradeRequestStates.find(requester->GetName());
+    if (stateIt == sInventoryItemTradeRequestStates.end())
+        return false;
+
+    InventoryItemTradeRequestState& state = stateIt->second;
+    PruneInventoryItemTradeRequestState(state, now);
+
+    for (auto const& entry : state.recentTokens)
+    {
+        if (entry.first == token)
+            return false;
+    }
+
+    state.recentTokens.push_back(std::make_pair(token, now));
+    while (state.recentTokens.size() > kInventoryItemTradeMaxRecentTokens)
         state.recentTokens.pop_front();
     return true;
 }
@@ -5689,6 +5781,123 @@ void RunInventoryItemMoveCommand(
         << kFieldSeparator << static_cast<uint32>(dstSlot);
 
     SendAddonPacket(requester, replyType, "INVENTORY_ITEM_MOVE", payload.str());
+}
+
+void RunInventoryItemTradeCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& botName,
+    std::string const& requestToken,
+    uint8 srcBag,
+    uint8 srcSlot,
+    uint32 srcItemId,
+    uint32 srcCount)
+{
+    std::string const trimmedBotName = Trim(botName);
+    std::string const token = Trim(requestToken);
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+
+    std::string reason;
+    bool added = false;
+    uint8 tradeSlot = 255;
+
+    if (!ConsumeInventoryItemTradeRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else if (!bot)
+        reason = "NO_BOT";
+    else
+    {
+        PlayerbotAI* const botAI = GetBotAI(bot);
+        if (!botAI || !botAI->GetSecurity() ||
+            !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+            reason = "FORBIDDEN";
+        else if (!RegisterInventoryItemTradeToken(requester, token))
+            reason = "DUPLICATE";
+        else if (!requester || !requester->GetSession())
+            reason = "NO_REQUESTER_SESSION";
+        else if (!bot->GetSession())
+            reason = "NO_BOT_SESSION";
+        else if (!bot->IsInWorld())
+            reason = "BOT_NOT_IN_WORLD";
+        else if (!bot->IsAlive())
+            reason = "BOT_DEAD";
+        else if (!IsInventoryItemMovePositionAllowed(bot, srcBag, srcSlot))
+            reason = "BAD_POSITION";
+        else
+        {
+            InventoryItemMovePositionState const sourceState =
+                ReadInventoryItemMovePositionState(bot, srcBag, srcSlot);
+
+            if (!InventoryItemMoveStateMatchesExpected(sourceState, srcItemId, srcCount))
+                reason = "SOURCE_STALE";
+            else
+            {
+                Item* const sourceItem = bot->GetItemByPos(srcBag, srcSlot);
+                TradeData* const botTrade = bot->GetTradeData();
+                TradeData* const requesterTrade = requester->GetTradeData();
+
+                if (!sourceItem)
+                    reason = "SOURCE_STALE";
+                else if (!botTrade || !requesterTrade)
+                    reason = "NO_TRADE";
+                else if (botTrade->GetTrader() != requester || requesterTrade->GetTrader() != bot)
+                    reason = "WRONG_TRADER";
+                else if (botTrade->HasItem(sourceItem->GetGUID()))
+                    reason = "ALREADY_IN_TRADE";
+                else if (!sourceItem->CanBeTraded(false, true))
+                    reason = "NOT_TRADABLE";
+                else if (sourceItem->IsBindedNotWith(requester))
+                    reason = "WRONG_BINDING";
+                else
+                {
+                    for (uint8 candidate = 0; candidate < TRADE_SLOT_TRADED_COUNT; ++candidate)
+                    {
+                        if (!botTrade->GetItem(TradeSlots(candidate)))
+                        {
+                            tradeSlot = candidate;
+                            break;
+                        }
+                    }
+
+                    if (tradeSlot >= TRADE_SLOT_TRADED_COUNT)
+                        reason = "TRADE_FULL";
+                    else
+                    {
+                        ObjectGuid const sourceGuid = sourceItem->GetGUID();
+
+                        WorldPacket packet(CMSG_SET_TRADE_ITEM, 3);
+                        packet << tradeSlot << srcBag << srcSlot;
+                        bot->GetSession()->HandleSetTradeItemOpcode(packet);
+
+                        TradeData* const updatedBotTrade = bot->GetTradeData();
+                        Item* const tradedItem = updatedBotTrade &&
+                            updatedBotTrade->GetTrader() == requester ?
+                            updatedBotTrade->GetItem(TradeSlots(tradeSlot)) : nullptr;
+
+                        added = tradedItem && tradedItem->GetGUID() == sourceGuid;
+                        reason = added ? "OK" : "TRADE_REJECTED";
+                    }
+                }
+            }
+        }
+    }
+
+    if (reason.empty())
+        reason = "FAILED";
+
+    std::ostringstream payload;
+    payload << UrlEncodeField(effectiveBotName)
+        << kFieldSeparator << token
+        << kFieldSeparator << (added ? "OK" : "ERR")
+        << kFieldSeparator << UrlEncodeField(reason)
+        << kFieldSeparator << static_cast<uint32>(srcBag)
+        << kFieldSeparator << static_cast<uint32>(srcSlot)
+        << kFieldSeparator << srcItemId
+        << kFieldSeparator << srcCount
+        << kFieldSeparator << static_cast<uint32>(tradeSlot);
+
+    SendAddonPacket(requester, replyType, "INVENTORY_ITEM_TRADE", payload.str());
 }
 
 void RunInventoryItemEquipCommand(
@@ -10584,6 +10793,36 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             player, replyType, fields[1], fields[2],
             static_cast<uint8>(srcBag), static_cast<uint8>(srcSlot), srcItemId, srcCount,
             static_cast<uint8>(dstBag), static_cast<uint8>(dstSlot), dstItemId, dstCount);
+        return true;
+    }
+
+    if (requestType == "ITEM_TRADE")
+    {
+        std::string const token = GetSafeErrorToken(fields, 2);
+        if (fields.size() != 7)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidCanonicalRawField(fields[1], kMaxBotNameLength, false))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+
+        if (!IsValidRequestToken(fields[2]))
+            return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        uint32 srcBag = 0;
+        uint32 srcSlot = 0;
+        uint32 srcItemId = 0;
+        uint32 srcCount = 0;
+        if (!TryParseUint32Field(fields[3], 0, 255, srcBag) ||
+            !TryParseUint32Field(fields[4], 0, 255, srcSlot) ||
+            !TryParseUint32Field(fields[5], 1, std::numeric_limits<uint32>::max(), srcItemId) ||
+            !TryParseUint32Field(fields[6], 1, kMaxInventoryItemTradeCount, srcCount))
+        {
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_NUMBER");
+        }
+
+        RunInventoryItemTradeCommand(
+            player, replyType, fields[1], fields[2],
+            static_cast<uint8>(srcBag), static_cast<uint8>(srcSlot), srcItemId, srcCount);
         return true;
     }
 
