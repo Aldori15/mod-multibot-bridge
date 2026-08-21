@@ -128,6 +128,11 @@ std::chrono::seconds constexpr kTalentApplyReplayTtl(10);
 std::size_t constexpr kTalentApplyMaxRecentTokens = 32;
 std::size_t constexpr kTalentApplyMaxRequesterStates = 512;
 std::size_t constexpr kMaxTalentApplyBuildLength = 128;
+std::size_t constexpr kTalentSpecApplyRateLimit = 4;
+std::chrono::milliseconds constexpr kTalentSpecApplyRateWindow(2000);
+std::chrono::seconds constexpr kTalentSpecApplyReplayTtl(10);
+std::size_t constexpr kTalentSpecApplyMaxRecentTokens = 32;
+std::size_t constexpr kTalentSpecApplyMaxRequesterStates = 512;
 std::size_t constexpr kQuestAbandonRateLimit = 4;
 std::chrono::milliseconds constexpr kQuestAbandonRateWindow(2000);
 std::chrono::seconds constexpr kQuestAbandonReplayTtl(10);
@@ -165,6 +170,7 @@ char const* const kInventoryBulkSellCapability = "INVENTORY_BULK_SELL_V1";
 char const* const kInventoryOpenCapability = "INVENTORY_OPEN_V1";
 char const* const kQuestAbandonCapability = "QUEST_ABANDON_V1";
 char const* const kTalentApplyCapability = "TALENT_APPLY_V1";
+char const* const kTalentSpecApplyCapability = "TALENT_SPEC_APPLY_V1";
 char const* const kGroupRollCapability = "GROUP_ROLL_V1";
 char const* const kEnchantTradeCapability = "ENCHANT_TRADE_V1";
 char const* const kSelfBotCapability = "SELF_BOT_V1";
@@ -211,6 +217,7 @@ void SendEnchantTradePackets(Player* requester, ChatMsg replyType, std::string c
 void RunEnchantTradeCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& spellIdValue);
 void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue);
 void RunTalentApplyCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& build);
+void RunTalentSpecApplyCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint32 slot, uint32 specIndex);
 void RunQuestAbandonCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, uint32 questId);
 void RunGroupRollCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& modeValue, std::string const& encodedItemLink);
 void RunFormationCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedFormation);
@@ -276,6 +283,7 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kInventoryOpenCapability,
         kQuestAbandonCapability,
         kTalentApplyCapability,
+        kTalentSpecApplyCapability,
         kGroupRollCapability,
         kEnchantTradeCapability,
         kSelfBotCapability,
@@ -1334,6 +1342,16 @@ void SendTalentSpecListPackets(Player* requester, ChatMsg replyType, std::string
 
     if (bot)
     {
+        std::array<uint32, 3> const currentTabs = BuildTalentTabPoints(bot);
+        std::ostringstream currentPayload;
+        currentPayload << UrlEncodeField(bot->GetName())
+            << kFieldSeparator << token
+            << kFieldSeparator << (static_cast<uint32>(bot->GetActiveSpec()) + 1)
+            << kFieldSeparator << currentTabs[0]
+            << kFieldSeparator << currentTabs[1]
+            << kFieldSeparator << currentTabs[2];
+        SendAddonPacket(requester, replyType, "TALENT_SPEC_CURRENT", currentPayload.str());
+
         std::vector<TalentSpecEntryData> const specs = BuildTalentSpecEntries(bot);
         for (TalentSpecEntryData const& spec : specs)
         {
@@ -5722,7 +5740,220 @@ void RunTalentApplyCommand(
     SendAddonPacket(requester, replyType, "TALENT_APPLY_RESULT", payload.str());
 }
 // MB_TALENT_APPLY_V1_END
-// MB_QUEST_ABANDON_V1_BEGIN
+// MB_TALENT_SPEC_APPLY_V1_BEGIN
+struct TalentSpecApplyRateState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+    std::deque<std::pair<std::string, std::chrono::steady_clock::time_point>> recentTokens;
+};
+
+std::map<std::string, TalentSpecApplyRateState> sTalentSpecApplyRateStates;
+
+bool ConsumeTalentSpecApplyRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+    TalentSpecApplyRateState& state = sTalentSpecApplyRateStates[key];
+
+    while (!state.requests.empty() && now - state.requests.front() >= kTalentSpecApplyRateWindow)
+        state.requests.pop_front();
+
+    if (state.requests.size() >= kTalentSpecApplyRateLimit)
+        return false;
+
+    state.requests.push_back(now);
+
+    if (sTalentSpecApplyRateStates.size() > kTalentSpecApplyMaxRequesterStates)
+    {
+        for (auto it = sTalentSpecApplyRateStates.begin(); it != sTalentSpecApplyRateStates.end();)
+        {
+            while (!it->second.requests.empty() && now - it->second.requests.front() >= kTalentSpecApplyRateWindow)
+                it->second.requests.pop_front();
+            while (!it->second.recentTokens.empty() && now - it->second.recentTokens.front().second >= kTalentSpecApplyReplayTtl)
+                it->second.recentTokens.pop_front();
+
+            if (it->second.requests.empty() && it->second.recentTokens.empty() && it->first != key)
+                it = sTalentSpecApplyRateStates.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    return true;
+}
+
+bool RegisterTalentSpecApplyToken(Player* requester, std::string const& token)
+{
+    if (!requester || !IsValidRequestToken(token))
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+    TalentSpecApplyRateState& state = sTalentSpecApplyRateStates[key];
+
+    while (!state.recentTokens.empty() && now - state.recentTokens.front().second >= kTalentSpecApplyReplayTtl)
+        state.recentTokens.pop_front();
+
+    for (auto const& entry : state.recentTokens)
+        if (entry.first == token)
+            return false;
+
+    state.recentTokens.push_back({token, now});
+    while (state.recentTokens.size() > kTalentSpecApplyMaxRecentTokens)
+        state.recentTokens.pop_front();
+
+    return true;
+}
+
+bool TryParseTalentSpecPointSummary(std::string const& summary, std::array<uint32, 3>& tabs)
+{
+    tabs = {0, 0, 0};
+
+    std::size_t const firstDash = summary.find('-');
+    if (firstDash == std::string::npos)
+        return false;
+    std::size_t const secondDash = summary.find('-', firstDash + 1);
+    if (secondDash == std::string::npos || summary.find('-', secondDash + 1) != std::string::npos)
+        return false;
+
+    std::array<std::string, 3> const fields =
+    {
+        summary.substr(0, firstDash),
+        summary.substr(firstDash + 1, secondDash - firstDash - 1),
+        summary.substr(secondDash + 1)
+    };
+
+    for (std::size_t index = 0; index < fields.size(); ++index)
+        if (!TryParseUint32Field(fields[index], 0, 255, tabs[index]))
+            return false;
+
+    return true;
+}
+
+bool FindTalentSpecEntry(Player* bot, uint32 specIndex, TalentSpecEntryData& selected)
+{
+    if (!bot || specIndex > 30)
+        return false;
+
+    std::vector<TalentSpecEntryData> const specs = BuildTalentSpecEntries(bot);
+    for (TalentSpecEntryData const& entry : specs)
+    {
+        if (entry.index == specIndex)
+        {
+            selected = entry;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void RunTalentSpecApplyCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& botName,
+    std::string const& requestToken,
+    uint32 slot,
+    uint32 specIndex)
+{
+    std::string const trimmedBotName = Trim(botName);
+    std::string const token = Trim(requestToken);
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+
+    std::string reason = "OK";
+    std::array<uint32, 3> expectedTabs = {0, 0, 0};
+    std::array<uint32, 3> actualTabs = {0, 0, 0};
+    TalentSpecEntryData selected;
+
+    PlayerbotAI* const botAI = bot ? GetBotAI(bot) : nullptr;
+
+    if (!requester || !requester->GetSession())
+        reason = "BAD_REQUEST";
+    else if (!ConsumeTalentSpecApplyRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else if (!RegisterTalentSpecApplyToken(requester, token))
+        reason = "DUPLICATE";
+    else if (!bot)
+        reason = "NO_BOT";
+    else if (!bot->GetSession() || !bot->IsInWorld())
+        reason = "BOT_UNAVAILABLE";
+    else if (!botAI)
+        reason = "NO_AI";
+    else if (slot < 1 || slot > 2)
+        reason = "BAD_SLOT";
+    else if (!FindTalentSpecEntry(bot, specIndex, selected))
+        reason = "SPEC_NOT_FOUND";
+    else if (selected.build.empty() || !TryParseTalentSpecPointSummary(selected.build, expectedTabs))
+        reason = "SPEC_BUILD_UNAVAILABLE";
+    else
+    {
+        uint8 const requestedSpec = static_cast<uint8>(slot - 1);
+
+        if (slot == 2 && bot->GetSpecsCount() < 2)
+        {
+            if (bot->GetLevel() < sWorld->getIntConfig(CONFIG_MIN_DUALSPEC_LEVEL))
+                reason = "DUAL_SPEC_LEVEL";
+            else
+            {
+                bot->CastSpell(bot, 63680, true, nullptr, nullptr, bot->GetGUID());
+                bot->CastSpell(bot, 63624, true, nullptr, nullptr, bot->GetGUID());
+                if (bot->GetSpecsCount() < 2)
+                    reason = "DUAL_SPEC_FAILED";
+            }
+        }
+
+        if (reason == "OK")
+        {
+            if (bot->IsNonMeleeSpellCast(false))
+                bot->InterruptNonMeleeSpells(false);
+
+            bot->ActivateSpec(requestedSpec);
+            if (bot->GetActiveSpec() != requestedSpec)
+                reason = "SWITCH_FAILED";
+        }
+
+        if (reason == "OK")
+        {
+            auto* const customGlyphs = botAI->GetAiObjectContext()->GetValue<bool>("custom_glyphs");
+            if (customGlyphs && customGlyphs->Get())
+                customGlyphs->Set(false);
+
+            PlayerbotFactory::InitTalentsBySpecNo(bot, static_cast<int>(specIndex), true);
+
+            PlayerbotFactory factory(bot, bot->GetLevel());
+            factory.InitGlyphs(false);
+
+            actualTabs = BuildTalentTabPoints(bot);
+            if (actualTabs != expectedTabs)
+                reason = "VERIFY_FAILED";
+            else
+                botAI->ResetStrategies();
+        }
+    }
+
+    if (bot && actualTabs == std::array<uint32, 3>{0, 0, 0})
+        actualTabs = BuildTalentTabPoints(bot);
+
+    std::string const status = reason == "OK" ? "OK" : "ERR";
+    std::ostringstream payload;
+    payload << token
+        << kFieldSeparator << UrlEncodeField(effectiveBotName)
+        << kFieldSeparator << status
+        << kFieldSeparator << UrlEncodeField(reason)
+        << kFieldSeparator << slot
+        << kFieldSeparator << specIndex
+        << kFieldSeparator << actualTabs[0]
+        << kFieldSeparator << actualTabs[1]
+        << kFieldSeparator << actualTabs[2];
+
+    SendAddonPacket(requester, replyType, "TALENT_SPEC_APPLY_RESULT", payload.str());
+}
+// MB_TALENT_SPEC_APPLY_V1_END// MB_QUEST_ABANDON_V1_BEGIN
+
 struct QuestAbandonRateState
 {
     std::deque<std::chrono::steady_clock::time_point> requests;
@@ -10958,6 +11189,30 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         RunTalentApplyCommand(player, replyType, botName, fields[1], build);
         return true;
     }
+    if (requestType == "TALENT_SPEC_APPLY")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 5)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_TOKEN");
+
+        std::string botName;
+        if (!TryUrlDecodeField(fields[2], botName, kMaxBotNameLength, false))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT");
+
+        uint32 slot = 0;
+        if (!TryParseUint32Field(fields[3], 1, 2, slot))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_SLOT");
+
+        uint32 specIndex = 0;
+        if (!TryParseUint32Field(fields[4], 0, 30, specIndex))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_SPEC");
+
+        RunTalentSpecApplyCommand(player, replyType, botName, fields[1], slot, specIndex);
+        return true;
+    }
+
     if (requestType == "QUEST_ABANDON")
     {
         std::string const token = GetSafeErrorToken(fields, 1);

@@ -505,7 +505,15 @@ should not be assumed to be generically fragmented by this capability.
   </tr>
   <tr>
     <td><code>GET~TALENT_SPEC_LIST</code></td>
-    <td>Refresh available talent spec templates without automatic chat parsing.</td>
+    <td>Refresh available talent spec templates and return <code>TALENT_SPEC_CURRENT</code> with the authoritative active slot/tree totals, without normal chat parsing.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~TALENT_APPLY</code> / <code>TALENT_APPLY_V1</code></td>
+    <td>Validate and apply one complete custom talent build through the audited Playerbots factory path, then return <code>TALENT_APPLY_RESULT</code> only after authoritative three-tree verification.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~TALENT_SPEC_APPLY</code> / <code>TALENT_SPEC_APPLY_V1</code></td>
+    <td>Apply a server-revalidated premade spec index to talent slot 1 or 2, including dual-spec handling, cast interruption, custom-glyph reset, <code>InitGlyphs(false)</code>, final tree verification and a structured <code>TALENT_SPEC_APPLY_RESULT</code>.</td>
   </tr>
   <tr>
     <td><code>GET~INVENTORY</code> / <code>INVENTORY_V1</code></td>
@@ -709,15 +717,16 @@ The endpoint and switching implementation remain present, while the project's fi
 
 # Current Development Baseline
 
-Documentation synchronized on **2026-08-20** against the post-merge Jellypowered + SelfBot baseline. The current Bridge development branch `jellypowered-chatless-integration-v2` was created directly from `main` and initially matched `main`, `origin/main` and its remote tracking branch at commit `d42b23dd288b6ff0871c57bedd98856b705594da` with 0/0 ahead-behind.
+Documentation synchronized on **2026-08-21** after runtime validation of the talent migration on `jellypowered-chatless-integration-v2`. The branch was originally created directly from the post-merge Jellypowered + SelfBot `main` baseline; current talent work remains isolated on this v2 branch with no PR/merge to `main` planned until explicitly requested.
 
-The Jellypowered bridge work is already merged into `main` through PR #28, merge commit `5e5ff7594ec8afedf40926605a60848dbc14991e`. Recent bridge-first milestones include `OUTFIT_V1`, `INVENTORY_V1`, hardened bank/guild-bank/vendor-buy item actions, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1`, the runtime-validated `ENCHANT_TRADE_V1` Enchanting Trade Service, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_TRADE_V1`, `ITEM_USE_V1`, the specialized `ITEM_DESTROY` path, `ITEM_SELL_SINGLE_V1`, `VENDOR_BUYBACK_V1` and `QUEST_ABANDON_V1`.
+The Jellypowered bridge work is already merged into `main` through PR #28, merge commit `5e5ff7594ec8afedf40926605a60848dbc14991e`. Recent bridge-first milestones include `OUTFIT_V1`, `INVENTORY_V1`, hardened bank/guild-bank/vendor-buy item actions, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1`, the runtime-validated `ENCHANT_TRADE_V1` Enchanting Trade Service, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_TRADE_V1`, `ITEM_USE_V1`, the specialized `ITEM_DESTROY` path, `ITEM_SELL_SINGLE_V1`, `VENDOR_BUYBACK_V1`, `QUEST_ABANDON_V1`, `TALENT_APPLY_V1` and `TALENT_SPEC_APPLY_V1`.
 
 `INVENTORY_EXACT_V1` exposes exact Backpack, equipped-bag and Keyring topology for the bag-aware addon UI. `ITEM_MOVE_V1` already supports whole-stack moves between allowed Backpack / Bag 1..4 / Keyring physical slots, including inter-container moves. It does **not** authorize the equipped bag slots themselves; any future `BAG_MOVE` work therefore concerns moving/re-equipping bag objects, not ordinary inventory items. `ITEM_TRADE_V1` now provides generic exact-item Trade through the native WoW Trade flow and was runtime validated in both directions; it remains distinct from the specialized `ENCHANT_TRADE_V1` service. `QUEST_ABANDON_V1` uses the typed AzerothCore Quest packet/session path and was runtime validated with one controlled bot with no chat spam; the mixed multi-bot runtime case is explicitly deferred until suitable bots are available. Quest sharing remains a native client behavior through `QuestLogPushQuest()` and therefore does not require a `QUEST_SHARE_V1` bridge capability. Exact move/equip/unequip/trade/use/single-sell/Buyback/quest-abandon flows revalidate server-side state and wait for structured authoritative results; no generic Playerbots command/chat executor is exposed.
 
+`TALENT_APPLY_V1` applies the editable custom talent tree through strict class/DBC/point validation and the audited Playerbots talent factory path, then verifies the actual three tree totals before returning success. `TALENT_SPEC_APPLY_V1` extends the existing premade-list transport with `TALENT_SPEC_CURRENT` and a structured apply operation by server-side spec index. Slot 1 and slot 2/dual-spec were compiled and runtime validated on 2026-08-21; the path reproduces cast interruption, validates/creates dual spec where eligible, clears `custom_glyphs`, runs `InitGlyphs(false)`, verifies final tree totals and resets strategies only after successful verification. Normal operation therefore does not need the historical talent-related whispers.
 The separate SelfBot work is also already merged into `main` through PR #30 **Complete SelfBot chatless bridge support**. The current bridge advertises `SELF_BOT_V1`, `SELF_STRATEGY_V1` and `SELF_ACTION_V1`. SelfBot residual findings such as `dps aoe` canonicalization and deferred Warlock rollback robustness remain outside the Jellypowered scope.
 
-The active Jellypowered v2 continuation should audit `TALENT_APPLY` next. Equipped-bag reassignment remains a low-priority residual. After the remaining Jellypowered batch, the normal roadmap resumes with item-specific loot-rule add/remove. Deferred work that must not interrupt that sequence includes the SELL_GREY/core-API follow-up and final Firestone/Spellstone TEMP_ENCHANT revalidation.
+`TALENT_APPLY_V1` and `TALENT_SPEC_APPLY_V1` are complete and runtime validated. The active Jellypowered v2 continuation is now `CRAFT_RECIPE_TARGET`. Equipped-bag reassignment remains a low-priority residual. After the remaining Jellypowered batch, the normal roadmap resumes with item-specific loot-rule add/remove. Deferred work that must not interrupt that sequence includes the SELL_GREY/core-API follow-up and final Firestone/Spellstone TEMP_ENCHANT revalidation.
 
 
 ---
