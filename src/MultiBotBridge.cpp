@@ -122,6 +122,12 @@ std::chrono::milliseconds constexpr kVendorBuybackRateWindow(2000);
 std::chrono::seconds constexpr kVendorBuybackReplayTtl(10);
 std::size_t constexpr kVendorBuybackMaxRecentTokens = 32;
 std::size_t constexpr kVendorBuybackMaxRequesterStates = 512;
+std::size_t constexpr kTalentApplyRateLimit = 4;
+std::chrono::milliseconds constexpr kTalentApplyRateWindow(2000);
+std::chrono::seconds constexpr kTalentApplyReplayTtl(10);
+std::size_t constexpr kTalentApplyMaxRecentTokens = 32;
+std::size_t constexpr kTalentApplyMaxRequesterStates = 512;
+std::size_t constexpr kMaxTalentApplyBuildLength = 128;
 std::size_t constexpr kQuestAbandonRateLimit = 4;
 std::chrono::milliseconds constexpr kQuestAbandonRateWindow(2000);
 std::chrono::seconds constexpr kQuestAbandonReplayTtl(10);
@@ -158,6 +164,7 @@ char const* const kVendorBuybackCapability = "VENDOR_BUYBACK_V1";
 char const* const kInventoryBulkSellCapability = "INVENTORY_BULK_SELL_V1";
 char const* const kInventoryOpenCapability = "INVENTORY_OPEN_V1";
 char const* const kQuestAbandonCapability = "QUEST_ABANDON_V1";
+char const* const kTalentApplyCapability = "TALENT_APPLY_V1";
 char const* const kGroupRollCapability = "GROUP_ROLL_V1";
 char const* const kEnchantTradeCapability = "ENCHANT_TRADE_V1";
 char const* const kSelfBotCapability = "SELF_BOT_V1";
@@ -203,12 +210,14 @@ void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::
 void SendEnchantTradePackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void RunEnchantTradeCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& spellIdValue);
 void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue);
+void RunTalentApplyCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& build);
 void RunQuestAbandonCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, uint32 questId);
 void RunGroupRollCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& modeValue, std::string const& encodedItemLink);
 void RunFormationCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedFormation);
 void SendFormationPackets(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken);
 void SendBotReputationPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void SendBotEmblemPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
+std::array<uint32, 3> BuildTalentTabPoints(Player* bot);
 uint32 GetPct(uint32 current, uint32 max);
 
 std::string Trim(std::string const& value)
@@ -266,6 +275,7 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kInventoryBulkSellCapability,
         kInventoryOpenCapability,
         kQuestAbandonCapability,
+        kTalentApplyCapability,
         kGroupRollCapability,
         kEnchantTradeCapability,
         kSelfBotCapability,
@@ -5492,6 +5502,226 @@ bool ConsumeItemActionRateLimit(Player* requester)
     return true;
 }
 
+// MB_TALENT_APPLY_V1_BEGIN
+struct TalentApplyRateState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+    std::deque<std::pair<std::string, std::chrono::steady_clock::time_point>> recentTokens;
+};
+
+std::map<std::string, TalentApplyRateState> sTalentApplyRateStates;
+
+bool ConsumeTalentApplyRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+    TalentApplyRateState& state = sTalentApplyRateStates[key];
+
+    while (!state.requests.empty() && now - state.requests.front() >= kTalentApplyRateWindow)
+        state.requests.pop_front();
+
+    if (state.requests.size() >= kTalentApplyRateLimit)
+        return false;
+
+    state.requests.push_back(now);
+
+    if (sTalentApplyRateStates.size() > kTalentApplyMaxRequesterStates)
+    {
+        for (auto it = sTalentApplyRateStates.begin(); it != sTalentApplyRateStates.end();)
+        {
+            while (!it->second.requests.empty() && now - it->second.requests.front() >= kTalentApplyRateWindow)
+                it->second.requests.pop_front();
+            while (!it->second.recentTokens.empty() && now - it->second.recentTokens.front().second >= kTalentApplyReplayTtl)
+                it->second.recentTokens.pop_front();
+
+            if (it->second.requests.empty() && it->second.recentTokens.empty() && it->first != key)
+                it = sTalentApplyRateStates.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    return true;
+}
+
+bool RegisterTalentApplyToken(Player* requester, std::string const& token)
+{
+    if (!requester || !IsValidRequestToken(token))
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+    TalentApplyRateState& state = sTalentApplyRateStates[key];
+
+    while (!state.recentTokens.empty() && now - state.recentTokens.front().second >= kTalentApplyReplayTtl)
+        state.recentTokens.pop_front();
+
+    for (auto const& entry : state.recentTokens)
+        if (entry.first == token)
+            return false;
+
+    state.recentTokens.push_back({token, now});
+    while (state.recentTokens.size() > kTalentApplyMaxRecentTokens)
+        state.recentTokens.pop_front();
+
+    return true;
+}
+
+bool ValidateTalentApplyBuild(
+    Player* bot,
+    std::string const& build,
+    std::vector<std::vector<uint32>>& parsed,
+    std::array<uint32, 3>& expectedTabs)
+{
+    parsed.clear();
+    expectedTabs = {0, 0, 0};
+
+    if (!bot || build.empty() || build.size() > kMaxTalentApplyBuildLength)
+        return false;
+
+    std::array<std::string, 3> sections;
+    std::size_t const firstDash = build.find('-');
+    if (firstDash == std::string::npos)
+        return false;
+    std::size_t const secondDash = build.find('-', firstDash + 1);
+    if (secondDash == std::string::npos || build.find('-', secondDash + 1) != std::string::npos)
+        return false;
+
+    sections[0] = build.substr(0, firstDash);
+    sections[1] = build.substr(firstDash + 1, secondDash - firstDash - 1);
+    sections[2] = build.substr(secondDash + 1);
+    if (sections[0].empty() || sections[1].empty() || sections[2].empty())
+        return false;
+
+    std::array<std::vector<TalentEntry const*>, 3> classTalents;
+    uint32 const classMask = bot->getClassMask();
+
+    for (uint32 index = 0; index < sTalentStore.GetNumRows(); ++index)
+    {
+        TalentEntry const* const talent = sTalentStore.LookupEntry(index);
+        if (!talent)
+            continue;
+
+        TalentTabEntry const* const tab = sTalentTabStore.LookupEntry(talent->TalentTab);
+        if (!tab || tab->tabpage >= classTalents.size() || !(tab->ClassMask & classMask))
+            continue;
+
+        classTalents[tab->tabpage].push_back(talent);
+    }
+
+    uint32 requestedPoints = 0;
+    for (std::size_t tabIndex = 0; tabIndex < classTalents.size(); ++tabIndex)
+    {
+        std::sort(classTalents[tabIndex].begin(), classTalents[tabIndex].end(),
+            [](TalentEntry const* left, TalentEntry const* right)
+            {
+                return left->Row != right->Row ? left->Row < right->Row : left->Col < right->Col;
+            });
+
+        if (sections[tabIndex].size() != classTalents[tabIndex].size())
+            return false;
+
+        for (std::size_t talentIndex = 0; talentIndex < sections[tabIndex].size(); ++talentIndex)
+        {
+            char const value = sections[tabIndex][talentIndex];
+            if (value < '0' || value > '5')
+                return false;
+
+            uint32 const requestedRank = static_cast<uint32>(value - '0');
+            TalentEntry const* const talent = classTalents[tabIndex][talentIndex];
+
+            uint32 maxRank = 0;
+            for (uint32 spellId : talent->RankID)
+                if (spellId)
+                    ++maxRank;
+
+            if (requestedRank > maxRank)
+                return false;
+
+            expectedTabs[tabIndex] += requestedRank;
+            requestedPoints += requestedRank;
+        }
+    }
+
+    if (!requestedPoints || requestedPoints > bot->CalculateTalentsPoints())
+        return false;
+
+    parsed = PlayerbotAIConfig::ParseTempTalentsOrder(bot->getClass(), build);
+    if (parsed.empty())
+        return false;
+
+    uint32 parsedPoints = 0;
+    for (std::vector<uint32> const& entry : parsed)
+    {
+        if (entry.size() != 4 || entry[0] >= expectedTabs.size() || !entry[3] || entry[3] > MAX_TALENT_RANK)
+            return false;
+        parsedPoints += entry[3];
+    }
+
+    return parsedPoints == requestedPoints;
+}
+
+void RunTalentApplyCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& botName,
+    std::string const& requestToken,
+    std::string const& build)
+{
+    std::string const trimmedBotName = Trim(botName);
+    std::string const token = Trim(requestToken);
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+
+    std::string reason = "OK";
+    std::array<uint32, 3> expectedTabs = {0, 0, 0};
+    std::array<uint32, 3> actualTabs = {0, 0, 0};
+    std::vector<std::vector<uint32>> parsed;
+
+    if (!requester || !requester->GetSession())
+        reason = "BAD_REQUEST";
+    else if (!ConsumeTalentApplyRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else if (!RegisterTalentApplyToken(requester, token))
+        reason = "DUPLICATE";
+    else if (!bot)
+        reason = "NO_BOT";
+    else if (!bot->GetSession() || !bot->IsInWorld())
+        reason = "BOT_UNAVAILABLE";
+    else if (!GetBotAI(bot))
+        reason = "NO_AI";
+    else if (!ValidateTalentApplyBuild(bot, build, parsed, expectedTabs))
+        reason = "INVALID_BUILD";
+    else
+    {
+        PlayerbotFactory::InitTalentsByParsedSpecLink(bot, parsed, true);
+        actualTabs = BuildTalentTabPoints(bot);
+
+        if (actualTabs != expectedTabs)
+            reason = "VERIFY_FAILED";
+        else
+        {
+            if (PlayerbotAI* const botAI = GetBotAI(bot))
+                botAI->ResetStrategies();
+        }
+    }
+
+    std::string const status = reason == "OK" ? "OK" : "ERR";
+    std::ostringstream payload;
+    payload << token
+        << kFieldSeparator << UrlEncodeField(effectiveBotName)
+        << kFieldSeparator << status
+        << kFieldSeparator << UrlEncodeField(reason)
+        << kFieldSeparator << actualTabs[0]
+        << kFieldSeparator << actualTabs[1]
+        << kFieldSeparator << actualTabs[2];
+
+    SendAddonPacket(requester, replyType, "TALENT_APPLY_RESULT", payload.str());
+}
+// MB_TALENT_APPLY_V1_END
 // MB_QUEST_ABANDON_V1_BEGIN
 struct QuestAbandonRateState
 {
@@ -10709,6 +10939,25 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         return true;
     }
 
+    if (requestType == "TALENT_APPLY")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 4)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_TOKEN");
+
+        std::string botName;
+        if (!TryUrlDecodeField(fields[2], botName, kMaxBotNameLength, false))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT");
+
+        std::string const build = Trim(fields[3]);
+        if (build.empty() || build.size() > kMaxTalentApplyBuildLength)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BUILD");
+
+        RunTalentApplyCommand(player, replyType, botName, fields[1], build);
+        return true;
+    }
     if (requestType == "QUEST_ABANDON")
     {
         std::string const token = GetSafeErrorToken(fields, 1);
