@@ -152,6 +152,11 @@ std::chrono::milliseconds constexpr kWarlockStoneSwitchCreateTimeout(7000);
 std::size_t constexpr kEnchantTradeRateLimit = 4;
 std::chrono::milliseconds constexpr kEnchantTradeRateWindow(2000);
 std::size_t constexpr kMaxEnchantTradeEntries = 256;
+std::size_t constexpr kCraftRecipeTargetRateLimit = 4;
+std::chrono::milliseconds constexpr kCraftRecipeTargetRateWindow(2000);
+std::chrono::seconds constexpr kCraftRecipeTargetReplayTtl(10);
+std::size_t constexpr kCraftRecipeTargetMaxRecentTokens = 32;
+std::size_t constexpr kCraftRecipeTargetMaxRequesterStates = 512;
 std::size_t constexpr kMaxGroupRollItemLinkLength = 160;
 char const* const kStateFramingCapability = "STATE_FRAMING_V1";
 char const* const kStrategyMutationCapability = "STRATEGY_MUTATION_V1";
@@ -171,6 +176,7 @@ char const* const kInventoryOpenCapability = "INVENTORY_OPEN_V1";
 char const* const kQuestAbandonCapability = "QUEST_ABANDON_V1";
 char const* const kTalentApplyCapability = "TALENT_APPLY_V1";
 char const* const kTalentSpecApplyCapability = "TALENT_SPEC_APPLY_V1";
+char const* const kCraftRecipeTargetCapability = "CRAFT_RECIPE_TARGET_V1";
 char const* const kGroupRollCapability = "GROUP_ROLL_V1";
 char const* const kEnchantTradeCapability = "ENCHANT_TRADE_V1";
 char const* const kSelfBotCapability = "SELF_BOT_V1";
@@ -213,6 +219,7 @@ void SendTrainerPackets(Player* requester, ChatMsg replyType, std::string const&
 void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& encodedSuffix, std::string const& persistToken);
 void RunTrainerLearnCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& trainerEntryValue, std::string const& spellIdValue);
 void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& skillIdValue, std::string const& spellIdValue, std::string const& itemIdValue);
+void RunProfessionRecipeTargetCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint32 skillId, uint32 spellId, uint32 targetBag, uint32 targetSlot, uint32 targetItemId);
 void SendEnchantTradePackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void RunEnchantTradeCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& spellIdValue);
 void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue);
@@ -284,6 +291,7 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kQuestAbandonCapability,
         kTalentApplyCapability,
         kTalentSpecApplyCapability,
+        kCraftRecipeTargetCapability,
         kGroupRollCapability,
         kEnchantTradeCapability,
         kSelfBotCapability,
@@ -1969,6 +1977,166 @@ std::string ValidateProfessionRecipeCraft(Player* bot, uint32 skillId, uint32 sp
 
     return "OK";
 }
+
+
+// MB_CRAFT_RECIPE_TARGET_V1_BEGIN
+bool ProfessionRecipeRequiresExactItemTarget(SpellInfo const* spellInfo)
+{
+    if (!spellInfo)
+        return false;
+
+    for (uint32 effectIndex = 0; effectIndex < MAX_SPELL_EFFECTS; ++effectIndex)
+        if (spellInfo->Effects[effectIndex].Effect == SPELL_EFFECT_OPEN_LOCK)
+            return false;
+
+    return (spellInfo->Targets & TARGET_FLAG_ITEM) != 0 ||
+        (spellInfo->Targets & TARGET_FLAG_GAMEOBJECT_ITEM) != 0;
+}
+
+bool IsAllowedProfessionRecipeTargetPosition(uint32 bag, uint32 slot)
+{
+    if (bag == INVENTORY_SLOT_BAG_0)
+    {
+        bool const equipment = slot >= EQUIPMENT_SLOT_START && slot < EQUIPMENT_SLOT_END;
+        bool const backpack = slot >= INVENTORY_SLOT_ITEM_START && slot < INVENTORY_SLOT_ITEM_END;
+        return equipment || backpack;
+    }
+
+    return bag >= INVENTORY_SLOT_BAG_START && bag < INVENTORY_SLOT_BAG_END;
+}
+
+struct CraftRecipeTargetRateState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+    std::deque<std::pair<std::string, std::chrono::steady_clock::time_point>> recentTokens;
+};
+
+std::map<std::string, CraftRecipeTargetRateState> sCraftRecipeTargetRateStates;
+
+void PruneCraftRecipeTargetRateState(CraftRecipeTargetRateState& state, std::chrono::steady_clock::time_point const now)
+{
+    while (!state.requests.empty() && now - state.requests.front() >= kCraftRecipeTargetRateWindow)
+        state.requests.pop_front();
+    while (!state.recentTokens.empty() && now - state.recentTokens.front().second >= kCraftRecipeTargetReplayTtl)
+        state.recentTokens.pop_front();
+    while (state.recentTokens.size() > kCraftRecipeTargetMaxRecentTokens)
+        state.recentTokens.pop_front();
+}
+
+bool ConsumeCraftRecipeTargetRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+    auto stateIt = sCraftRecipeTargetRateStates.find(key);
+
+    if (stateIt == sCraftRecipeTargetRateStates.end())
+    {
+        if (sCraftRecipeTargetRateStates.size() >= kCraftRecipeTargetMaxRequesterStates)
+        {
+            for (auto it = sCraftRecipeTargetRateStates.begin(); it != sCraftRecipeTargetRateStates.end();)
+            {
+                PruneCraftRecipeTargetRateState(it->second, now);
+                if (it->second.requests.empty() && it->second.recentTokens.empty())
+                    it = sCraftRecipeTargetRateStates.erase(it);
+                else
+                    ++it;
+            }
+        }
+
+        if (sCraftRecipeTargetRateStates.size() >= kCraftRecipeTargetMaxRequesterStates)
+            return false;
+
+        stateIt = sCraftRecipeTargetRateStates.emplace(key, CraftRecipeTargetRateState()).first;
+    }
+
+    CraftRecipeTargetRateState& state = stateIt->second;
+    PruneCraftRecipeTargetRateState(state, now);
+    if (state.requests.size() >= kCraftRecipeTargetRateLimit)
+        return false;
+
+    state.requests.push_back(now);
+    return true;
+}
+
+bool RegisterCraftRecipeTargetToken(Player* requester, std::string const& token)
+{
+    if (!requester || !IsValidRequestToken(token))
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    auto stateIt = sCraftRecipeTargetRateStates.find(requester->GetName());
+    if (stateIt == sCraftRecipeTargetRateStates.end())
+        return false;
+
+    CraftRecipeTargetRateState& state = stateIt->second;
+    PruneCraftRecipeTargetRateState(state, now);
+
+    for (auto const& entry : state.recentTokens)
+        if (entry.first == token)
+            return false;
+
+    state.recentTokens.push_back({token, now});
+    while (state.recentTokens.size() > kCraftRecipeTargetMaxRecentTokens)
+        state.recentTokens.pop_front();
+    return true;
+}
+
+std::string CastProfessionRecipeTarget(Player* bot, uint32 spellId, Item* targetItem)
+{
+    if (!bot || !spellId || !targetItem)
+        return "BAD_REQUEST";
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI)
+        return "NO_AI";
+
+    SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(spellId);
+    if (!spellInfo || !ProfessionRecipeRequiresExactItemTarget(spellInfo))
+        return "NOT_ITEM_TARGET_RECIPE";
+
+    if (bot->HasUnitState(UNIT_STATE_LOST_CONTROL))
+        return "LOST_CONTROL";
+
+    if (bot->IsFlying() || bot->HasUnitState(UNIT_STATE_IN_FLIGHT))
+        return "IN_FLIGHT";
+
+    if (bot->GetCurrentSpell(CURRENT_CHANNELED_SPELL) != nullptr)
+        return "CHANNELING";
+
+    if (bot->HasSpellCooldown(spellId))
+        return "NOT_READY";
+
+    if (!bot->IsStandState())
+    {
+        bot->SetStandState(UNIT_STAND_STATE_STAND);
+        return "NOT_STANDING";
+    }
+
+    uint32 const castTime = !spellInfo->IsChanneled() ? spellInfo->CalcCastTime(bot) : spellInfo->GetDuration();
+    if ((castTime || spellInfo->IsAutoRepeatRangedSpell()) && bot->isMoving())
+        return "MOVING";
+
+    Spell spell(bot, spellInfo, TRIGGERED_NONE);
+    SpellCastTargets targets;
+    targets.SetItemTarget(targetItem);
+    spell.InitExplicitTargets(targets);
+
+    SpellCastResult const checkResult = spell.CheckCast(true);
+    if (checkResult == SPELL_FAILED_BAD_TARGETS ||
+        checkResult == SPELL_FAILED_ITEM_ENCHANT_TRADE_WINDOW ||
+        checkResult == SPELL_FAILED_NOT_TRADEABLE)
+    {
+        return "INVALID_TARGET_ITEM";
+    }
+    if (checkResult != SPELL_CAST_OK)
+        return GetSpellCastFailureReason(checkResult);
+
+    return botAI->CastSpell(spellId, bot, targetItem) ? "OK" : "TRY_AGAIN";
+}
+// MB_CRAFT_RECIPE_TARGET_V1_HELPERS_END
 
 void BuildProfessionRecipeCastTargets(Player* bot, PlayerbotAI* botAI, SpellInfo const* spellInfo, SpellCastTargets& targets)
 {
@@ -7722,7 +7890,13 @@ void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::
     uint32 actualItemId = expectedItemId;
     std::string result = ValidateProfessionRecipeCraft(bot, skillId, spellId, expectedItemId, actualItemId);
     if (result == "OK")
-        result = CastProfessionRecipe(bot, spellId);
+    {
+        SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(spellId);
+        if (ProfessionRecipeRequiresExactItemTarget(spellInfo))
+            result = "TARGET_REQUIRED";
+        else
+            result = CastProfessionRecipe(bot, spellId);
+    }
 
     std::ostringstream payload;
     payload << UrlEncodeField(effectiveBotName)
@@ -7735,6 +7909,86 @@ void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::
 
     SendAddonPacket(requester, replyType, "PROFESSION_RECIPE_CRAFT", payload.str());
 }
+
+
+// MB_CRAFT_RECIPE_TARGET_V1_COMMAND_BEGIN
+void RunProfessionRecipeTargetCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& botName,
+    std::string const& requestToken,
+    uint32 skillId,
+    uint32 spellId,
+    uint32 targetBag,
+    uint32 targetSlot,
+    uint32 targetItemId)
+{
+    if (!requester || !requester->GetSession())
+        return;
+
+    std::string const trimmedBotName = Trim(botName);
+    std::string const token = Trim(requestToken);
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+
+    std::string reason = "OK";
+    Item* targetItem = nullptr;
+    PlayerbotAI* const botAI = bot ? GetBotAI(bot) : nullptr;
+
+    if (!ConsumeCraftRecipeTargetRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else if (!RegisterCraftRecipeTargetToken(requester, token))
+        reason = "REPLAY";
+    else if (!bot)
+        reason = "NO_BOT";
+    else if (!bot->GetSession() || !bot->IsInWorld())
+        reason = "BOT_UNAVAILABLE";
+    else if (!bot->IsAlive())
+        reason = "BOT_DEAD";
+    else if (!botAI)
+        reason = "NO_AI";
+    else if (!botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+        reason = "FORBIDDEN";
+    else if (!IsAllowedProfessionRecipeTargetPosition(targetBag, targetSlot))
+        reason = "BAD_TARGET_POSITION";
+    else if (!bot->IsValidPos(static_cast<uint8>(targetBag), static_cast<uint8>(targetSlot), true))
+        reason = "BAD_TARGET_POSITION";
+    else
+    {
+        targetItem = bot->GetItemByPos(static_cast<uint8>(targetBag), static_cast<uint8>(targetSlot));
+        if (!targetItem)
+            reason = "MISSING_TARGET_ITEM";
+        else if (targetItem->GetEntry() != targetItemId)
+            reason = "TARGET_STALE";
+    }
+
+    uint32 ignoredCreatedItemId = 0;
+    if (reason == "OK")
+        reason = ValidateProfessionRecipeCraft(bot, skillId, spellId, 0, ignoredCreatedItemId);
+
+    SpellInfo const* const spellInfo = reason == "OK" ? sSpellMgr->GetSpellInfo(spellId) : nullptr;
+    if (reason == "OK" && !ProfessionRecipeRequiresExactItemTarget(spellInfo))
+        reason = "NOT_ITEM_TARGET_RECIPE";
+
+    if (reason == "OK")
+        reason = CastProfessionRecipeTarget(bot, spellId, targetItem);
+
+    std::string const status = reason == "OK" ? "OK" : "ERR";
+    std::ostringstream payload;
+    payload << token
+        << kFieldSeparator << UrlEncodeField(effectiveBotName)
+        << kFieldSeparator << status
+        << kFieldSeparator << UrlEncodeField(reason)
+        << kFieldSeparator << skillId
+        << kFieldSeparator << spellId
+        << kFieldSeparator << targetBag
+        << kFieldSeparator << targetSlot
+        << kFieldSeparator << targetItemId;
+
+    SendAddonPacket(requester, replyType, "CRAFT_RECIPE_TARGET_RESULT", payload.str());
+}
+// MB_CRAFT_RECIPE_TARGET_V1_END
 
 void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& encodedSuffix, std::string const& persistToken)
 {
@@ -11167,6 +11421,41 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         }
 
         RunProfessionRecipeCraftCommand(player, replyType, fields[1], fields[2], fields[3], fields[4], fields[5]);
+        return true;
+    }
+
+
+    if (requestType == "CRAFT_RECIPE_TARGET")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 8)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        std::string botName;
+        if (!TryUrlDecodeField(fields[2], botName, kMaxBotNameLength, false))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT");
+
+        uint32 skillId = 0;
+        uint32 spellId = 0;
+        uint32 targetBag = 0;
+        uint32 targetSlot = 0;
+        uint32 targetItemId = 0;
+        if (!TryParseUint32Field(fields[3], 1, std::numeric_limits<uint32>::max(), skillId) ||
+            !TryParseUint32Field(fields[4], 1, std::numeric_limits<uint32>::max(), spellId) ||
+            !TryParseUint32Field(fields[5], 0, 255, targetBag) ||
+            !TryParseUint32Field(fields[6], 0, 255, targetSlot) ||
+            !TryParseUint32Field(fields[7], 1, std::numeric_limits<uint32>::max(), targetItemId))
+        {
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_NUMBER");
+        }
+
+        RunProfessionRecipeTargetCommand(
+            player, replyType, botName, fields[1],
+            skillId, spellId, targetBag, targetSlot, targetItemId
+        );
         return true;
     }
 
