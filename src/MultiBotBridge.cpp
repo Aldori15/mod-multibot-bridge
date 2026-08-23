@@ -82,6 +82,9 @@ std::size_t constexpr kItemActionRateLimit = 24;
 std::chrono::milliseconds constexpr kItemActionRateWindow(2000);
 std::size_t constexpr kInventoryExactRateLimit = 8;
 std::chrono::milliseconds constexpr kInventoryExactRateWindow(2000);
+std::size_t constexpr kBankSnapshotRateLimit = 4;
+std::chrono::milliseconds constexpr kBankSnapshotRateWindow(2000);
+std::size_t constexpr kBankSnapshotMaxRequesterStates = 512;
 std::size_t constexpr kInventoryItemMoveRateLimit = 8;
 std::chrono::milliseconds constexpr kInventoryItemMoveRateWindow(2000);
 std::chrono::seconds constexpr kInventoryItemMoveReplayTtl(10);
@@ -2626,6 +2629,58 @@ bool ConsumeInventoryExactRateLimit(Player* requester)
         }
     }
 
+    return true;
+}
+
+struct BankSnapshotRateState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+};
+
+std::map<std::string, BankSnapshotRateState> sBankSnapshotRateStates;
+
+void PruneBankSnapshotRateState(BankSnapshotRateState& state, std::chrono::steady_clock::time_point const now)
+{
+    while (!state.requests.empty() && now - state.requests.front() >= kBankSnapshotRateWindow)
+        state.requests.pop_front();
+}
+
+bool ConsumeBankSnapshotRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+    auto stateIt = sBankSnapshotRateStates.find(key);
+
+    if (stateIt == sBankSnapshotRateStates.end())
+    {
+        if (sBankSnapshotRateStates.size() >= kBankSnapshotMaxRequesterStates)
+        {
+            for (auto it = sBankSnapshotRateStates.begin(); it != sBankSnapshotRateStates.end();)
+            {
+                PruneBankSnapshotRateState(it->second, now);
+                if (it->second.requests.empty())
+                    it = sBankSnapshotRateStates.erase(it);
+                else
+                    ++it;
+            }
+        }
+
+        if (sBankSnapshotRateStates.size() >= kBankSnapshotMaxRequesterStates)
+            return false;
+
+        stateIt = sBankSnapshotRateStates.emplace(key, BankSnapshotRateState()).first;
+    }
+
+    BankSnapshotRateState& state = stateIt->second;
+    PruneBankSnapshotRateState(state, now);
+
+    if (state.requests.size() >= kBankSnapshotRateLimit)
+        return false;
+
+    state.requests.push_back(now);
     return true;
 }
 
@@ -11198,10 +11253,31 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             }
             else if (requestType == "BUYBACK")
                 SendVendorBuybackPackets(player, replyType, fields[1], fields[2]);
-            else if (requestType == "BANK")
-                SendBankPackets(player, replyType, fields[1], fields[2]);
-            else if (requestType == "GBANK")
-                SendGuildBankPackets(player, replyType, fields[1], fields[2]);
+            else if (requestType == "BANK" || requestType == "GBANK")
+            {
+                if (!ConsumeBankSnapshotRateLimit(player))
+                {
+                    std::string const prefixPayload = UrlEncodeField(fields[1]) + std::string(1, kFieldSeparator) + fields[2];
+                    if (requestType == "BANK")
+                    {
+                        SendAddonPacket(player, replyType, "BANK_BEGIN", prefixPayload);
+                        SendAddonPacket(player, replyType, "BANK_ERROR", prefixPayload + std::string(1, kFieldSeparator) + "RATE_LIMIT");
+                        SendAddonPacket(player, replyType, "BANK_END", prefixPayload);
+                    }
+                    else
+                    {
+                        SendAddonPacket(player, replyType, "GBANK_BEGIN", prefixPayload);
+                        SendAddonPacket(player, replyType, "GBANK_ERROR", prefixPayload + std::string(1, kFieldSeparator) + "RATE_LIMIT");
+                        SendAddonPacket(player, replyType, "GBANK_END", prefixPayload);
+                    }
+                    return true;
+                }
+
+                if (requestType == "BANK")
+                    SendBankPackets(player, replyType, fields[1], fields[2]);
+                else
+                    SendGuildBankPackets(player, replyType, fields[1], fields[2]);
+            }
             else if (requestType == "SPELLBOOK")
                 SendSpellbookSnapshot(player, replyType, fields[1], fields[2]);
             else if (requestType == "BOT_SKILLS")
