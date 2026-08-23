@@ -5505,7 +5505,7 @@ bool IsBridgeSellVendorCandidate(Player* bot, PlayerbotAI* botAI, Item* item,
         return false;
 
     ItemUsage const usage = context->GetValue<ItemUsage>("item usage", item->GetEntry())->Get();
-    return usage == ITEM_USAGE_VENDOR || usage == ITEM_USAGE_AH;
+    return usage == ITEM_USAGE_VENDOR;
 }
 
 void CollectBridgeSellVendorCandidate(Player* bot, PlayerbotAI* botAI, Item* item,
