@@ -9082,7 +9082,7 @@ bool CanExposeRandomHolderBot(Player* requester, Player* bot)
 
 void AppendBridgeVisibleBot(Player* bot, std::vector<Player*>& bots, std::set<ObjectGuid>& seen)
 {
-    if (!bot)
+    if (!bot || !bot->IsInWorld())
         return;
 
     if (!seen.insert(bot->GetGUID()).second)
