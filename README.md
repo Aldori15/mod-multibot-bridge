@@ -567,7 +567,7 @@ should not be assumed to be generically fragmented by this capability.
   </tr>
   <tr>
     <td><code>RUN~ITEM_ACTION</code> — <code>SELL_VENDOR</code> / <code>SELL_GREY</code></td>
-    <td>Run bounded bulk-sell actions after bot/security/rate-limit validation. <code>SELL_VENDOR</code> is the normal bridge-first Sell Vendor path; further SELL_GREY project work is explicitly deferred.</td>
+    <td>Run bounded bulk-sell actions after bot/security/rate-limit validation. <code>SELL_VENDOR</code> is the normal bridge-first Sell Vendor path and accepts <code>ITEM_USAGE_VENDOR</code> only; <code>ITEM_USAGE_AH</code> is explicitly excluded from this action. The Addon legacy <code>s vendor</code> path is reachable only when <code>MultiBot.allowLegacyChatFallback == true</code>. Further SELL_GREY project work is explicitly deferred.</td>
   </tr>
   <tr>
     <td><code>RUN~ITEM_ACTION</code> — <code>OPEN_ITEMS</code></td>
@@ -735,7 +735,7 @@ The endpoint and switching implementation remain present, while the project's fi
 
 # Current Development Baseline
 
-Documentation synchronized on **2026-08-22** after runtime validation of `CRAFT_RECIPE_TARGET_V1` on `jellypowered-chatless-integration-v2`. The branch was originally created directly from the post-merge Jellypowered + SelfBot `main` baseline; current Jellypowered v2 work remains isolated on this branch with no PR/merge to `main` planned until explicitly requested.
+Documentation synchronized on **2026-08-23** after runtime validation of `CRAFT_RECIPE_TARGET_V1` and the final `SELL_VENDOR` safety hardening on `jellypowered-chatless-integration-v2`. The branch was originally created directly from the post-merge Jellypowered + SelfBot `main` baseline; current Jellypowered v2 work remains isolated on this branch with no PR/merge to `main` planned until explicitly requested.
 
 The Jellypowered bridge work is already merged into `main` through PR #28, merge commit `5e5ff7594ec8afedf40926605a60848dbc14991e`. Recent bridge-first milestones include `OUTFIT_V1`, `INVENTORY_V1`, hardened bank/guild-bank/vendor-buy item actions, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1`, the runtime-validated `ENCHANT_TRADE_V1` Enchanting Trade Service, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_TRADE_V1`, `ITEM_USE_V1`, the specialized `ITEM_DESTROY` path, `ITEM_SELL_SINGLE_V1`, `VENDOR_BUYBACK_V1`, `QUEST_ABANDON_V1`, `TALENT_APPLY_V1`, `TALENT_SPEC_APPLY_V1` and the runtime-validated `CRAFT_RECIPE_TARGET_V1` targeted profession path.
 
@@ -744,7 +744,11 @@ The Jellypowered bridge work is already merged into `main` through PR #28, merge
 `TALENT_APPLY_V1` applies the editable custom talent tree through strict class/DBC/point validation and the audited Playerbots talent factory path, then verifies the actual three tree totals before returning success. `TALENT_SPEC_APPLY_V1` extends the existing premade-list transport with `TALENT_SPEC_CURRENT` and a structured apply operation by server-side spec index. Slot 1 and slot 2/dual-spec were compiled and runtime validated on 2026-08-21; the path reproduces cast interruption, validates/creates dual spec where eligible, clears `custom_glyphs`, runs `InitGlyphs(false)`, verifies final tree totals and resets strategies only after successful verification. Normal operation therefore does not need the historical talent-related whispers.
 The separate SelfBot work is also already merged into `main` through PR #30 **Complete SelfBot chatless bridge support**. The current bridge advertises `SELF_BOT_V1`, `SELF_STRATEGY_V1` and `SELF_ACTION_V1`. SelfBot residual findings such as `dps aoe` canonicalization and deferred Warlock rollback robustness remain outside the Jellypowered scope.
 
-`TALENT_APPLY_V1`, `TALENT_SPEC_APPLY_V1` and `CRAFT_RECIPE_TARGET_V1` are complete and runtime validated. The active Jellypowered v2 continuation is now the bank / guild-bank / vendor and inventory-selection comparison, taking forward only demonstrable improvements. Equipped-bag reassignment remains a low-priority residual. After the remaining Jellypowered batch, the normal roadmap resumes with item-specific loot-rule add/remove. Deferred work that must not interrupt that sequence includes the SELL_GREY/core-API follow-up and final Firestone/Spellstone TEMP_ENCHANT revalidation.
+`TALENT_APPLY_V1`, `TALENT_SPEC_APPLY_V1` and `CRAFT_RECIPE_TARGET_V1` are complete and runtime validated.
+
+`SELL_VENDOR` safety hardening was completed and runtime revalidated on 2026-08-23 at Bridge commit `3ccf5047f7994218b742312fe1437f4b303f7159` paired with Addon commit `fe2c807785219b82ca885f1a95d7c1dc27f0eed0`. The Bridge now accepts `ITEM_USAGE_VENDOR` only for `SELL_VENDOR` and explicitly excludes `ITEM_USAGE_AH`; runtime regression testing confirmed Symbol of Kings and Gold Ore are preserved while vendor selling remains functional. The Addon keeps the historical `s vendor` path only behind `MultiBot.allowLegacyChatFallback == true`.
+
+The active Jellypowered v2 continuation is now the bank / guild-bank / vendor and inventory-selection comparison, taking forward only demonstrable improvements. Equipped-bag reassignment remains a low-priority residual. After the remaining Jellypowered batch, the normal roadmap resumes with item-specific loot-rule add/remove. Deferred work that must not interrupt that sequence includes the SELL_GREY/core-API follow-up and final Firestone/Spellstone TEMP_ENCHANT revalidation.
 
 
 ---
