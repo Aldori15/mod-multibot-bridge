@@ -100,6 +100,14 @@ std::chrono::milliseconds constexpr kInventoryItemDepositExactRateWindow(2000);
 std::chrono::seconds constexpr kInventoryItemDepositExactReplayTtl(10);
 std::size_t constexpr kInventoryItemDepositExactMaxRecentTokens = 32;
 std::size_t constexpr kInventoryItemDepositExactMaxRequesterStates = 512;
+std::size_t constexpr kLootRuleItemRateLimit = 8;
+std::chrono::milliseconds constexpr kLootRuleItemRateWindow(2000);
+std::chrono::seconds constexpr kLootRuleItemReplayTtl(10);
+std::size_t constexpr kLootRuleItemMaxRecentTokens = 32;
+std::size_t constexpr kLootRuleItemMaxRequesterStates = 512;
+std::size_t constexpr kLootRuleItemMaxMatchedBots = 128;
+std::size_t constexpr kLootRuleItemPersistenceBudget = 128;
+std::chrono::seconds constexpr kLootRuleItemPersistenceWindow(10);
 std::size_t constexpr kInventoryItemEquipRateLimit = 8;
 std::chrono::milliseconds constexpr kInventoryItemEquipRateWindow(2000);
 std::chrono::seconds constexpr kInventoryItemEquipReplayTtl(10);
@@ -182,6 +190,7 @@ char const* const kInventoryItemSellCapability = "ITEM_SELL_SINGLE_V1";
 char const* const kVendorBuybackCapability = "VENDOR_BUYBACK_V1";
 char const* const kInventoryBulkSellCapability = "INVENTORY_BULK_SELL_V1";
 char const* const kInventoryOpenCapability = "INVENTORY_OPEN_V1";
+char const* const kLootRuleItemCapability = "LOOT_RULE_ITEM_V1";
 char const* const kQuestAbandonCapability = "QUEST_ABANDON_V1";
 char const* const kTalentApplyCapability = "TALENT_APPLY_V1";
 char const* const kTalentSpecApplyCapability = "TALENT_SPEC_APPLY_V1";
@@ -226,6 +235,7 @@ void SendInventoryExactSnapshot(Player* requester, ChatMsg replyType, std::strin
 void RunInventoryItemMoveCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint8 srcBag, uint8 srcSlot, uint32 srcItemId, uint32 srcCount, uint8 dstBag, uint8 dstSlot, uint32 dstItemId, uint32 dstCount);
 void RunInventoryItemTradeCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint8 srcBag, uint8 srcSlot, uint32 srcItemId, uint32 srcCount);
 void RunInventoryItemDepositExactCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, uint8 srcBag, uint8 srcSlot, uint32 srcItemId, uint32 srcCount);
+void RunLootRuleItemCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& actionValue, uint32 itemId);
 void SendTrainerPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& encodedSuffix, std::string const& persistToken);
 void RunTrainerLearnCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& trainerEntryValue, std::string const& spellIdValue);
@@ -300,6 +310,7 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kVendorBuybackCapability,
         kInventoryBulkSellCapability,
         kInventoryOpenCapability,
+        kLootRuleItemCapability,
         kQuestAbandonCapability,
         kTalentApplyCapability,
         kTalentSpecApplyCapability,
@@ -2868,6 +2879,112 @@ bool RegisterInventoryItemDepositExactToken(Player* requester, std::string const
     return true;
 }
 
+// MB_LOOT_RULE_ITEM_V1_RATE_BEGIN
+struct LootRuleItemRequestState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+    std::deque<std::pair<std::string, std::chrono::steady_clock::time_point>> recentTokens;
+};
+
+std::map<std::string, LootRuleItemRequestState> sLootRuleItemRequestStates;
+
+void PruneLootRuleItemRequestState(
+    LootRuleItemRequestState& state,
+    std::chrono::steady_clock::time_point const now)
+{
+    while (!state.requests.empty() && now - state.requests.front() >= kLootRuleItemRateWindow)
+        state.requests.pop_front();
+    while (!state.recentTokens.empty() && now - state.recentTokens.front().second >= kLootRuleItemReplayTtl)
+        state.recentTokens.pop_front();
+    while (state.recentTokens.size() > kLootRuleItemMaxRecentTokens)
+        state.recentTokens.pop_front();
+}
+
+bool ConsumeLootRuleItemRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+    auto stateIt = sLootRuleItemRequestStates.find(key);
+    if (stateIt == sLootRuleItemRequestStates.end())
+    {
+        if (sLootRuleItemRequestStates.size() >= kLootRuleItemMaxRequesterStates)
+        {
+            for (auto it = sLootRuleItemRequestStates.begin(); it != sLootRuleItemRequestStates.end();)
+            {
+                PruneLootRuleItemRequestState(it->second, now);
+                if (it->second.requests.empty() && it->second.recentTokens.empty())
+                    it = sLootRuleItemRequestStates.erase(it);
+                else
+                    ++it;
+            }
+        }
+
+        if (sLootRuleItemRequestStates.size() >= kLootRuleItemMaxRequesterStates)
+            return false;
+
+        stateIt = sLootRuleItemRequestStates.emplace(key, LootRuleItemRequestState()).first;
+    }
+
+    LootRuleItemRequestState& state = stateIt->second;
+    PruneLootRuleItemRequestState(state, now);
+    if (state.requests.size() >= kLootRuleItemRateLimit)
+        return false;
+
+    state.requests.push_back(now);
+    return true;
+}
+
+bool RegisterLootRuleItemToken(Player* requester, std::string const& token)
+{
+    if (!requester || !IsValidRequestToken(token))
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    auto stateIt = sLootRuleItemRequestStates.find(requester->GetName());
+    if (stateIt == sLootRuleItemRequestStates.end())
+        return false;
+
+    LootRuleItemRequestState& state = stateIt->second;
+    PruneLootRuleItemRequestState(state, now);
+    for (auto const& entry : state.recentTokens)
+        if (entry.first == token)
+            return false;
+
+    state.recentTokens.push_back(std::make_pair(token, now));
+    while (state.recentTokens.size() > kLootRuleItemMaxRecentTokens)
+        state.recentTokens.pop_front();
+    return true;
+}
+// MB_LOOT_RULE_ITEM_PERSISTENCE_BUDGET_BEGIN
+std::deque<std::chrono::steady_clock::time_point> sLootRuleItemPersistenceSaves;
+
+bool ReserveLootRuleItemPersistenceBudget(std::size_t count)
+{
+    if (count == 0)
+        return true;
+    if (count > kLootRuleItemPersistenceBudget)
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    while (!sLootRuleItemPersistenceSaves.empty() &&
+           now - sLootRuleItemPersistenceSaves.front() >= kLootRuleItemPersistenceWindow)
+    {
+        sLootRuleItemPersistenceSaves.pop_front();
+    }
+
+    if (sLootRuleItemPersistenceSaves.size() > kLootRuleItemPersistenceBudget - count)
+        return false;
+
+    for (std::size_t i = 0; i < count; ++i)
+        sLootRuleItemPersistenceSaves.push_back(now);
+
+    return true;
+}
+// MB_LOOT_RULE_ITEM_PERSISTENCE_BUDGET_END
+// MB_LOOT_RULE_ITEM_V1_RATE_END
 struct InventoryItemTradeRequestState
 {
     std::deque<std::chrono::steady_clock::time_point> requests;
@@ -10305,6 +10422,154 @@ void RunPositionCommand(Player* requester, ChatMsg replyType, std::string const&
     SendAddonPacket(requester, replyType, "POSITION_ACK", payload.str());
 }
 
+// MB_LOOT_RULE_ITEM_V1_BEGIN
+void RunLootRuleItemCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& scopeValue,
+    std::string const& encodedTarget,
+    std::string const& requestToken,
+    std::string const& actionValue,
+    uint32 itemId)
+{
+    std::string const scope = ToUpper(Trim(scopeValue));
+    std::string const target = Trim(UrlDecodeField(encodedTarget));
+    std::string const token = Trim(requestToken);
+    std::string const action = ToUpper(Trim(actionValue));
+    std::string reason;
+    uint32 matched = 0;
+    uint32 changed = 0;
+    bool ok = false;
+
+    if (!ConsumeLootRuleItemRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else if (!requester || !requester->GetSession())
+        reason = "NO_REQUESTER_SESSION";
+    else if (!requester->IsInWorld())
+        reason = "REQUESTER_NOT_IN_WORLD";
+    else if (!RegisterLootRuleItemToken(requester, token))
+        reason = "DUPLICATE";
+    else if (action != "ADD" && action != "REMOVE")
+        reason = "BAD_ACTION";
+    else if (!sObjectMgr->GetItemTemplate(itemId))
+        reason = "INVALID_ITEM";
+    else
+    {
+        std::vector<PlayerbotAI*> selected;
+        for (Player* const bot : GetBridgeVisibleBots(requester))
+        {
+            if (!BotMatchesCombatScope(requester, bot, scope, target))
+                continue;
+
+            if (selected.size() >= kLootRuleItemMaxMatchedBots)
+            {
+                reason = "TOO_MANY_BOTS";
+                break;
+            }
+
+            PlayerbotAI* const botAI = GetBotAI(bot);
+            if (!botAI || !botAI->GetSecurity() ||
+                !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+            {
+                reason = "FORBIDDEN";
+                break;
+            }
+            if (!bot->GetSession())
+            {
+                reason = "NO_BOT_SESSION";
+                break;
+            }
+            if (!bot->IsInWorld())
+            {
+                reason = "BOT_NOT_IN_WORLD";
+                break;
+            }
+            if (!bot->IsAlive())
+            {
+                reason = "BOT_DEAD";
+                break;
+            }
+            if (!botAI->GetAiObjectContext())
+            {
+                reason = "NO_BOT_CONTEXT";
+                break;
+            }
+
+            selected.push_back(botAI);
+        }
+
+        if (reason.empty() && selected.empty())
+            reason = "NO_BOTS";
+        else if (reason.empty())
+        {
+            matched = static_cast<uint32>(selected.size());
+            std::vector<PlayerbotAI*> changedBots;
+            changedBots.reserve(selected.size());
+
+            for (PlayerbotAI* const botAI : selected)
+            {
+                AiObjectContext* const context = botAI->GetAiObjectContext();
+                std::set<uint32>& alwaysLootItems =
+                    context->GetValue<std::set<uint32>&>("always loot list")->Get();
+
+                bool const needsChange =
+                    action == "ADD"
+                        ? alwaysLootItems.find(itemId) == alwaysLootItems.end()
+                        : alwaysLootItems.find(itemId) != alwaysLootItems.end();
+                if (needsChange)
+                    changedBots.push_back(botAI);
+            }
+
+            if (!ReserveLootRuleItemPersistenceBudget(changedBots.size()))
+                reason = "PERSISTENCE_BUSY";
+            else
+            {
+                changed = static_cast<uint32>(changedBots.size());
+                for (PlayerbotAI* const botAI : changedBots)
+                {
+                    AiObjectContext* const context = botAI->GetAiObjectContext();
+                    std::set<uint32>& alwaysLootItems =
+                        context->GetValue<std::set<uint32>&>("always loot list")->Get();
+
+                    if (action == "ADD")
+                        alwaysLootItems.insert(itemId);
+                    else
+                        alwaysLootItems.erase(itemId);
+
+                    PlayerbotRepository::instance().Save(botAI);
+                }
+
+                ok = true;
+                if (action == "ADD")
+                    reason = changed == matched ? "ADDED" : (changed == 0 ? "ALREADY_PRESENT" : "PARTIAL");
+                else
+                    reason = changed == matched ? "REMOVED" : (changed == 0 ? "ALREADY_ABSENT" : "PARTIAL");
+            }
+        }
+    }
+
+    if (!ok)
+    {
+        matched = 0;
+        changed = 0;
+        if (reason.empty())
+            reason = "FAILED";
+    }
+
+    std::ostringstream payload;
+    payload << scope
+        << kFieldSeparator << UrlEncodeField(target)
+        << kFieldSeparator << token
+        << kFieldSeparator << action
+        << kFieldSeparator << itemId
+        << kFieldSeparator << (ok ? "OK" : "ERR")
+        << kFieldSeparator << UrlEncodeField(reason)
+        << kFieldSeparator << matched
+        << kFieldSeparator << changed;
+
+    SendAddonPacket(requester, replyType, "LOOT_RULE_ITEM_RESULT", payload.str());
+}
+// MB_LOOT_RULE_ITEM_V1_END
 void RunLootCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
 {
     std::string const scope = ToUpper(Trim(scopeValue));
@@ -12079,6 +12344,56 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         return true;
     }
 
+    if (requestType == "LOOT_RULE_ITEM")
+    {
+        std::string const token = GetSafeErrorToken(fields, 3);
+        if (fields.size() != 6)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        std::string const scope = ToUpper(Trim(fields[1]));
+        if (fields[1] != scope ||
+            (scope != "ALL" && scope != "RAID" && scope != "GROUP" && scope != "PARTY" && scope != "BOT"))
+        {
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_SCOPE");
+        }
+
+        if (fields[2].size() > kMaxBotNameLength ||
+            !IsValidEncodedField(fields[2], kMaxBotNameLength, true))
+        {
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_ENCODING");
+        }
+
+        std::string target;
+        if (!TryUrlDecodeField(fields[2], target, kMaxBotNameLength, true))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_ENCODING");
+        if (target != Trim(target))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_TARGET");
+        if ((scope == "BOT" && target.empty()) ||
+            ((scope == "ALL" || scope == "RAID") && !target.empty()))
+        {
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_TARGET");
+        }
+        if ((scope == "GROUP" || scope == "PARTY") && !target.empty())
+        {
+            uint32 groupNumber = 0;
+            if (!TryParseUint32Field(target, 1, 8, groupNumber))
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_TARGET");
+        }
+
+        if (!IsValidRequestToken(fields[3]))
+            return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        std::string const action = ToUpper(Trim(fields[4]));
+        if (fields[4] != action || (action != "ADD" && action != "REMOVE"))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_ACTION");
+
+        uint32 itemId = 0;
+        if (!TryParseUint32Field(fields[5], 1, std::numeric_limits<uint32>::max(), itemId))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_NUMBER");
+
+        RunLootRuleItemCommand(player, replyType, fields[1], fields[2], fields[3], fields[4], itemId);
+        return true;
+    }
     if (requestType == "ITEM_DEPOSIT_EXACT")
     {
         std::string const token = GetSafeErrorToken(fields, 2);
