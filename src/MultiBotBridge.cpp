@@ -95,6 +95,11 @@ std::chrono::milliseconds constexpr kInventoryItemTradeRateWindow(2000);
 std::chrono::seconds constexpr kInventoryItemTradeReplayTtl(10);
 std::size_t constexpr kInventoryItemTradeMaxRecentTokens = 32;
 std::size_t constexpr kInventoryItemTradeMaxRequesterStates = 512;
+std::size_t constexpr kInventoryItemDepositExactRateLimit = 8;
+std::chrono::milliseconds constexpr kInventoryItemDepositExactRateWindow(2000);
+std::chrono::seconds constexpr kInventoryItemDepositExactReplayTtl(10);
+std::size_t constexpr kInventoryItemDepositExactMaxRecentTokens = 32;
+std::size_t constexpr kInventoryItemDepositExactMaxRequesterStates = 512;
 std::size_t constexpr kInventoryItemEquipRateLimit = 8;
 std::chrono::milliseconds constexpr kInventoryItemEquipRateWindow(2000);
 std::chrono::seconds constexpr kInventoryItemEquipReplayTtl(10);
@@ -168,6 +173,7 @@ char const* const kInventoryCapability = "INVENTORY_V1";
 char const* const kInventoryExactCapability = "INVENTORY_EXACT_V1";
 char const* const kInventoryItemMoveCapability = "ITEM_MOVE_V1";
 char const* const kInventoryItemTradeCapability = "ITEM_TRADE_V1";
+char const* const kInventoryItemDepositExactCapability = "ITEM_DEPOSIT_EXACT_V1";
 char const* const kInventoryItemEquipCapability = "ITEM_EQUIP_V1";
 char const* const kInventoryItemUnequipCapability = "ITEM_UNEQUIP_V1";
 char const* const kInventoryItemDestroyCapability = "ITEM_DESTROY_V1";
@@ -188,6 +194,7 @@ char const* const kSelfActionCapability = "SELF_ACTION_V1";
 uint32 constexpr kMaxItemActionCount = 1000;
 uint32 constexpr kMaxInventoryItemMoveCount = 1000;
 uint32 constexpr kMaxInventoryItemTradeCount = 1000;
+uint32 constexpr kMaxInventoryItemDepositExactCount = 1000;
 uint32 constexpr kMaxInventoryItemEquipCount = 1000;
 uint32 constexpr kMaxInventoryItemDestroyCount = 1000;
 uint32 constexpr kMaxInventoryItemUseCount = 1000;
@@ -218,6 +225,7 @@ void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& 
 void SendInventoryExactSnapshot(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void RunInventoryItemMoveCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint8 srcBag, uint8 srcSlot, uint32 srcItemId, uint32 srcCount, uint8 dstBag, uint8 dstSlot, uint32 dstItemId, uint32 dstCount);
 void RunInventoryItemTradeCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint8 srcBag, uint8 srcSlot, uint32 srcItemId, uint32 srcCount);
+void RunInventoryItemDepositExactCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, uint8 srcBag, uint8 srcSlot, uint32 srcItemId, uint32 srcCount);
 void SendTrainerPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& encodedSuffix, std::string const& persistToken);
 void RunTrainerLearnCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& trainerEntryValue, std::string const& spellIdValue);
@@ -283,6 +291,7 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kInventoryExactCapability,
         kInventoryItemMoveCapability,
         kInventoryItemTradeCapability,
+        kInventoryItemDepositExactCapability,
         kInventoryItemEquipCapability,
         kInventoryItemUnequipCapability,
         kInventoryItemDestroyCapability,
@@ -2771,6 +2780,91 @@ bool RegisterInventoryItemMoveToken(Player* requester, std::string const& token)
     state.recentTokens.push_back(std::make_pair(token, now));
     while (state.recentTokens.size() > kInventoryItemMoveMaxRecentTokens)
         state.recentTokens.pop_front();
+    return true;
+}
+
+struct InventoryItemDepositExactRequestState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+    std::deque<std::pair<std::string, std::chrono::steady_clock::time_point>> recentTokens;
+};
+
+std::map<std::string, InventoryItemDepositExactRequestState> sInventoryItemDepositExactRequestStates;
+
+void PruneInventoryItemDepositExactRequestState(
+    InventoryItemDepositExactRequestState& state,
+    std::chrono::steady_clock::time_point const now)
+{
+    while (!state.requests.empty() && now - state.requests.front() >= kInventoryItemDepositExactRateWindow)
+        state.requests.pop_front();
+    while (!state.recentTokens.empty() && now - state.recentTokens.front().second >= kInventoryItemDepositExactReplayTtl)
+        state.recentTokens.pop_front();
+    while (state.recentTokens.size() > kInventoryItemDepositExactMaxRecentTokens)
+        state.recentTokens.pop_front();
+}
+
+bool ConsumeInventoryItemDepositExactRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+    auto stateIt = sInventoryItemDepositExactRequestStates.find(key);
+
+    if (stateIt == sInventoryItemDepositExactRequestStates.end())
+    {
+        if (sInventoryItemDepositExactRequestStates.size() >= kInventoryItemDepositExactMaxRequesterStates)
+        {
+            for (auto it = sInventoryItemDepositExactRequestStates.begin();
+                 it != sInventoryItemDepositExactRequestStates.end();)
+            {
+                PruneInventoryItemDepositExactRequestState(it->second, now);
+                if (it->second.requests.empty() && it->second.recentTokens.empty())
+                    it = sInventoryItemDepositExactRequestStates.erase(it);
+                else
+                    ++it;
+            }
+        }
+
+        if (sInventoryItemDepositExactRequestStates.size() >= kInventoryItemDepositExactMaxRequesterStates)
+            return false;
+
+        stateIt = sInventoryItemDepositExactRequestStates.emplace(
+            key, InventoryItemDepositExactRequestState()).first;
+    }
+
+    InventoryItemDepositExactRequestState& state = stateIt->second;
+    PruneInventoryItemDepositExactRequestState(state, now);
+
+    if (state.requests.size() >= kInventoryItemDepositExactRateLimit)
+        return false;
+
+    state.requests.push_back(now);
+    return true;
+}
+
+bool RegisterInventoryItemDepositExactToken(Player* requester, std::string const& token)
+{
+    if (!requester || !IsValidRequestToken(token))
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    auto stateIt = sInventoryItemDepositExactRequestStates.find(requester->GetName());
+    if (stateIt == sInventoryItemDepositExactRequestStates.end())
+        return false;
+
+    InventoryItemDepositExactRequestState& state = stateIt->second;
+    PruneInventoryItemDepositExactRequestState(state, now);
+
+    for (auto const& entry : state.recentTokens)
+        if (entry.first == token)
+            return false;
+
+    state.recentTokens.push_back(std::make_pair(token, now));
+    while (state.recentTokens.size() > kInventoryItemDepositExactMaxRecentTokens)
+        state.recentTokens.pop_front();
+
     return true;
 }
 
@@ -6631,6 +6725,144 @@ void RunInventoryItemMoveCommand(
         << kFieldSeparator << static_cast<uint32>(dstSlot);
 
     SendAddonPacket(requester, replyType, "INVENTORY_ITEM_MOVE", payload.str());
+}
+
+void RunInventoryItemDepositExactCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& botName,
+    std::string const& requestToken,
+    std::string const& actionValue,
+    uint8 srcBag,
+    uint8 srcSlot,
+    uint32 srcItemId,
+    uint32 srcCount)
+{
+    std::string const trimmedBotName = Trim(botName);
+    std::string const token = Trim(requestToken);
+    std::string const action = ToUpper(Trim(actionValue));
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+
+    std::string reason;
+    uint32 moved = 0;
+
+    if (!ConsumeInventoryItemDepositExactRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else if (!bot)
+        reason = "NO_BOT";
+    else
+    {
+        PlayerbotAI* const botAI = GetBotAI(bot);
+        if (!botAI || !botAI->GetSecurity() ||
+            !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+            reason = "FORBIDDEN";
+        else if (!RegisterInventoryItemDepositExactToken(requester, token))
+            reason = "DUPLICATE";
+        else if (!requester || !requester->GetSession())
+            reason = "NO_REQUESTER_SESSION";
+        else if (!bot->GetSession())
+            reason = "NO_BOT_SESSION";
+        else if (!bot->IsInWorld())
+            reason = "BOT_NOT_IN_WORLD";
+        else if (!bot->IsAlive())
+            reason = "BOT_DEAD";
+        else if (action != "BANK_DEPOSIT" && action != "GBANK_DEPOSIT")
+            reason = "BAD_ACTION";
+        else if (!IsInventoryItemEquipSourcePositionAllowed(bot, srcBag, srcSlot))
+            reason = "BAD_POSITION";
+        else
+        {
+            InventoryItemMovePositionState const sourceState =
+                ReadInventoryItemMovePositionState(bot, srcBag, srcSlot);
+
+            if (!InventoryItemMoveStateMatchesExpected(sourceState, srcItemId, srcCount))
+                reason = "SOURCE_STALE";
+            else
+            {
+                Item* const sourceItem = bot->GetItemByPos(srcBag, srcSlot);
+                if (!sourceItem)
+                    reason = "SOURCE_STALE";
+                else if (action == "BANK_DEPOSIT")
+                {
+                    if (!FindNearbyNpcWithFlag(bot, UNIT_NPC_FLAG_BANKER))
+                        reason = "BANKER_NOT_FOUND";
+                    else
+                    {
+                        ItemPosCountVec dest;
+                        InventoryResult const bankResult =
+                            bot->CanBankItem(NULL_BAG, NULL_SLOT, dest, sourceItem, false);
+                        if (bankResult != EQUIP_ERR_OK)
+                            reason = "BANK_FULL";
+                        else
+                        {
+                            ObjectGuid const sourceGuid = sourceItem->GetGUID();
+                            bot->RemoveItem(srcBag, srcSlot, true);
+                            bot->BankItem(dest, sourceItem, true);
+
+                            Item* const remaining = bot->GetItemByPos(srcBag, srcSlot);
+                            if (remaining && remaining->GetGUID() == sourceGuid)
+                                reason = "POSTCONDITION_FAILED";
+                            else
+                                moved = srcCount;
+                        }
+                    }
+                }
+                else
+                {
+                    if (!bot->GetGuildId())
+                        reason = "BOT_NOT_IN_GUILD";
+                    else if (requester->GetGuildId() != bot->GetGuildId())
+                        reason = "NOT_IN_SAME_GUILD";
+                    else
+                    {
+                        Guild* const guild = sGuildMgr->GetGuildById(bot->GetGuildId());
+                        if (!guild)
+                            reason = "BOT_NOT_IN_GUILD";
+                        else if (!FindNearbyGuildBank(bot))
+                            reason = "GUILD_BANK_NOT_FOUND";
+                        else if (!guild->MemberHasTabRights(
+                                     requester->GetGUID(), 0, GUILD_BANK_RIGHT_DEPOSIT_ITEM) ||
+                                 !guild->MemberHasTabRights(
+                                     bot->GetGUID(), 0, GUILD_BANK_RIGHT_DEPOSIT_ITEM))
+                            reason = "NO_GUILD_BANK_RIGHTS";
+                        else
+                        {
+                            ObjectGuid const sourceGuid = sourceItem->GetGUID();
+                            guild->SwapItemsWithInventory(
+                                bot, false, 0, 255, srcBag, srcSlot, 0);
+
+                            Item* const remaining = bot->GetItemByPos(srcBag, srcSlot);
+                            if (remaining && remaining->GetGUID() == sourceGuid)
+                                reason = "GUILD_BANK_FULL";
+                            else
+                                moved = srcCount;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    bool const ok = moved == srcCount && moved > 0;
+    if (ok)
+        reason = "OK";
+    else if (reason.empty())
+        reason = "FAILED";
+
+    std::ostringstream payload;
+    payload << UrlEncodeField(effectiveBotName)
+        << kFieldSeparator << token
+        << kFieldSeparator << (ok ? "OK" : "ERR")
+        << kFieldSeparator << UrlEncodeField(reason)
+        << kFieldSeparator << action
+        << kFieldSeparator << static_cast<uint32>(srcBag)
+        << kFieldSeparator << static_cast<uint32>(srcSlot)
+        << kFieldSeparator << srcItemId
+        << kFieldSeparator << srcCount
+        << kFieldSeparator << moved;
+
+    SendAddonPacket(requester, replyType, "ITEM_DEPOSIT_EXACT", payload.str());
 }
 
 void RunInventoryItemTradeCommand(
@@ -11844,6 +12076,51 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             player, replyType, fields[1], fields[2],
             static_cast<uint8>(srcBag), static_cast<uint8>(srcSlot), srcItemId, srcCount,
             static_cast<uint8>(dstBag), static_cast<uint8>(dstSlot), dstItemId, dstCount);
+        return true;
+    }
+
+    if (requestType == "ITEM_DEPOSIT_EXACT")
+    {
+        std::string const token = GetSafeErrorToken(fields, 2);
+        if (fields.size() != 8)
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidCanonicalRawField(fields[1], kMaxBotNameLength, false))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+
+        if (!IsValidRequestToken(fields[2]))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        std::string const action = ToUpper(Trim(fields[3]));
+        if (fields[3] != action ||
+            (action != "BANK_DEPOSIT" && action != "GBANK_DEPOSIT"))
+        {
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_ACTION");
+        }
+
+        uint32 srcBag = 0;
+        uint32 srcSlot = 0;
+        uint32 srcItemId = 0;
+        uint32 srcCount = 0;
+        if (!TryParseUint32Field(fields[4], 0, 255, srcBag) ||
+            !TryParseUint32Field(fields[5], 0, 255, srcSlot) ||
+            !TryParseUint32Field(
+                fields[6], 1, std::numeric_limits<uint32>::max(), srcItemId) ||
+            !TryParseUint32Field(
+                fields[7], 1, kMaxInventoryItemDepositExactCount, srcCount))
+        {
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_NUMBER");
+        }
+
+        RunInventoryItemDepositExactCommand(
+            player, replyType, fields[1], fields[2], action,
+            static_cast<uint8>(srcBag), static_cast<uint8>(srcSlot),
+            srcItemId, srcCount);
         return true;
     }
 
