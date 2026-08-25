@@ -6127,6 +6127,7 @@ void RunTalentApplyCommand(
     std::string const token = Trim(requestToken);
     Player* const bot = FindBotByName(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+    PlayerbotAI* const botAI = bot ? GetBotAI(bot) : nullptr;
 
     std::string reason = "OK";
     std::array<uint32, 3> expectedTabs = {0, 0, 0};
@@ -6143,8 +6144,11 @@ void RunTalentApplyCommand(
         reason = "NO_BOT";
     else if (!bot->GetSession() || !bot->IsInWorld())
         reason = "BOT_UNAVAILABLE";
-    else if (!GetBotAI(bot))
+    else if (!botAI)
         reason = "NO_AI";
+    else if (!botAI->GetSecurity() ||
+             !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+        reason = "FORBIDDEN";
     else if (!ValidateTalentApplyBuild(bot, build, parsed, expectedTabs))
         reason = "INVALID_BUILD";
     else
@@ -6155,10 +6159,7 @@ void RunTalentApplyCommand(
         if (actualTabs != expectedTabs)
             reason = "VERIFY_FAILED";
         else
-        {
-            if (PlayerbotAI* const botAI = GetBotAI(bot))
-                botAI->ResetStrategies();
-        }
+            botAI->ResetStrategies();
     }
 
     std::string const status = reason == "OK" ? "OK" : "ERR";
@@ -6317,6 +6318,9 @@ void RunTalentSpecApplyCommand(
         reason = "BOT_UNAVAILABLE";
     else if (!botAI)
         reason = "NO_AI";
+    else if (!botAI->GetSecurity() ||
+             !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+        reason = "FORBIDDEN";
     else if (slot < 1 || slot > 2)
         reason = "BAD_SLOT";
     else if (!FindTalentSpecEntry(bot, specIndex, selected))
