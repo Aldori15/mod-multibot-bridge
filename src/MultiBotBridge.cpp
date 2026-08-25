@@ -6064,6 +6064,7 @@ bool ValidateTalentApplyBuild(
         classTalents[tab->tabpage].push_back(talent);
     }
 
+    std::map<uint32, uint32> requestedRanks;
     uint32 requestedPoints = 0;
     for (std::size_t tabIndex = 0; tabIndex < classTalents.size(); ++tabIndex)
     {
@@ -6093,8 +6094,47 @@ bool ValidateTalentApplyBuild(
             if (requestedRank > maxRank)
                 return false;
 
+            requestedRanks[talent->TalentID] = requestedRank;
             expectedTabs[tabIndex] += requestedRank;
             requestedPoints += requestedRank;
+        }
+    }
+
+    for (std::size_t tabIndex = 0; tabIndex < classTalents.size(); ++tabIndex)
+    {
+        uint32 pointsInPriorRows = 0;
+        std::size_t talentIndex = 0;
+        while (talentIndex < classTalents[tabIndex].size())
+        {
+            uint32 const row = classTalents[tabIndex][talentIndex]->Row;
+            uint32 pointsInRow = 0;
+
+            while (talentIndex < classTalents[tabIndex].size() &&
+                   classTalents[tabIndex][talentIndex]->Row == row)
+            {
+                TalentEntry const* const talent = classTalents[tabIndex][talentIndex];
+                uint32 const requestedRank =
+                    static_cast<uint32>(sections[tabIndex][talentIndex] - '0');
+
+                if (requestedRank)
+                {
+                    if (pointsInPriorRows < talent->Row * MAX_TALENT_RANK)
+                        return false;
+
+                    if (talent->DependsOn)
+                    {
+                        auto const dependency = requestedRanks.find(talent->DependsOn);
+                        if (dependency == requestedRanks.end() ||
+                            dependency->second <= talent->DependsOnRank)
+                            return false;
+                    }
+                }
+
+                pointsInRow += requestedRank;
+                ++talentIndex;
+            }
+
+            pointsInPriorRows += pointsInRow;
         }
     }
 
