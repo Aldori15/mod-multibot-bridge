@@ -6475,6 +6475,30 @@ bool ConsumeQuestAbandonRateLimit(Player* requester)
 
     std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
     std::string const key = requester->GetName();
+    auto stateIt = sQuestAbandonRateStates.find(key);
+
+    if (stateIt == sQuestAbandonRateStates.end())
+    {
+        if (sQuestAbandonRateStates.size() >= kQuestAbandonMaxRequesterStates)
+        {
+            for (auto it = sQuestAbandonRateStates.begin(); it != sQuestAbandonRateStates.end();)
+            {
+                while (!it->second.requests.empty() && now - it->second.requests.front() >= kQuestAbandonRateWindow)
+                    it->second.requests.pop_front();
+                while (!it->second.recentTokens.empty() && now - it->second.recentTokens.front().second >= kQuestAbandonReplayTtl)
+                    it->second.recentTokens.pop_front();
+
+                if (it->second.requests.empty() && it->second.recentTokens.empty())
+                    it = sQuestAbandonRateStates.erase(it);
+                else
+                    ++it;
+            }
+        }
+
+        if (sQuestAbandonRateStates.size() >= kQuestAbandonMaxRequesterStates)
+            return false;
+    }
+
     QuestAbandonRateState& state = sQuestAbandonRateStates[key];
 
     while (!state.requests.empty() && now - state.requests.front() >= kQuestAbandonRateWindow)
@@ -6484,23 +6508,6 @@ bool ConsumeQuestAbandonRateLimit(Player* requester)
         return false;
 
     state.requests.push_back(now);
-
-    if (sQuestAbandonRateStates.size() > kQuestAbandonMaxRequesterStates)
-    {
-        for (auto it = sQuestAbandonRateStates.begin(); it != sQuestAbandonRateStates.end();)
-        {
-            while (!it->second.requests.empty() && now - it->second.requests.front() >= kQuestAbandonRateWindow)
-                it->second.requests.pop_front();
-            while (!it->second.recentTokens.empty() && now - it->second.recentTokens.front().second >= kQuestAbandonReplayTtl)
-                it->second.recentTokens.pop_front();
-
-            if (it->second.requests.empty() && it->second.recentTokens.empty() && it->first != key)
-                it = sQuestAbandonRateStates.erase(it);
-            else
-                ++it;
-        }
-    }
-
     return true;
 }
 
@@ -6511,7 +6518,11 @@ bool RegisterQuestAbandonToken(Player* requester, std::string const& token)
 
     std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
     std::string const key = requester->GetName();
-    QuestAbandonRateState& state = sQuestAbandonRateStates[key];
+    auto stateIt = sQuestAbandonRateStates.find(key);
+    if (stateIt == sQuestAbandonRateStates.end())
+        return false;
+
+    QuestAbandonRateState& state = stateIt->second;
 
     while (!state.recentTokens.empty() && now - state.recentTokens.front().second >= kQuestAbandonReplayTtl)
         state.recentTokens.pop_front();
