@@ -5102,6 +5102,40 @@ uint32 MoveMatchingBankItemsToBags(Player* bot, uint32 itemId, uint32 requestedC
     return moved;
 }
 
+bool TryDepositGuildBankStack(
+    Guild* guild,
+    Player* requester,
+    Player* bot,
+    uint8 playerBag,
+    uint8 playerSlot,
+    ObjectGuid const& itemGuid,
+    bool& hasAuthorizedTab)
+{
+    hasAuthorizedTab = false;
+    if (!guild || !requester || !bot)
+        return false;
+
+    for (uint8 tabId = 0; tabId < GUILD_BANK_MAX_TABS; ++tabId)
+    {
+        if (!guild->MemberHasTabRights(
+                requester->GetGUID(), tabId, GUILD_BANK_RIGHT_DEPOSIT_ITEM) ||
+            !guild->MemberHasTabRights(
+                bot->GetGUID(), tabId, GUILD_BANK_RIGHT_DEPOSIT_ITEM))
+        {
+            continue;
+        }
+
+        hasAuthorizedTab = true;
+        guild->SwapItemsWithInventory(
+            bot, false, tabId, 255, playerBag, playerSlot, 0);
+
+        Item* const remaining = bot->GetItemByPos(playerBag, playerSlot);
+        if (!remaining || remaining->GetGUID() != itemGuid)
+            return true;
+    }
+
+    return false;
+}
 uint32 MoveMatchingBagItemsToGuildBank(Player* requester, Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
 {
     if (!requester || !bot || !itemId)
@@ -5135,28 +5169,22 @@ uint32 MoveMatchingBagItemsToGuildBank(Player* requester, Player* bot, uint32 it
         return 0;
     }
 
-    if (!guild->MemberHasTabRights(requester->GetGUID(), 0, GUILD_BANK_RIGHT_DEPOSIT_ITEM)
-        || !guild->MemberHasTabRights(bot->GetGUID(), 0, GUILD_BANK_RIGHT_DEPOSIT_ITEM))
-    {
-        reason = "NO_GUILD_BANK_RIGHTS";
-        return 0;
-    }
 
     uint32 moved = 0;
     while (Item* const item = FindBagItemByEntry(bot, itemId))
     {
         uint32 const stackCount = item->GetCount();
-        uint32 const playerSlot = item->GetSlot();
-        uint32 const playerBag = item->GetBagSlot();
+        uint8 const playerSlot = item->GetSlot();
+        uint8 const playerBag = item->GetBagSlot();
         ObjectGuid const itemGuid = item->GetGUID();
-        guild->SwapItemsWithInventory(bot, false, 0, 255, playerBag, playerSlot, 0);
 
-        if (Item* const remaining = bot->GetItemByPos(playerBag, playerSlot))
-            if (remaining->GetGUID() == itemGuid)
-            {
-                reason = "GUILD_BANK_FULL";
-                return moved;
-            }
+        bool hasAuthorizedTab = false;
+        if (!TryDepositGuildBankStack(
+                guild, requester, bot, playerBag, playerSlot, itemGuid, hasAuthorizedTab))
+        {
+            reason = hasAuthorizedTab ? "GUILD_BANK_FULL" : "NO_GUILD_BANK_RIGHTS";
+            return moved;
+        }
 
         moved += stackCount;
 
@@ -6982,22 +7010,15 @@ void RunInventoryItemDepositExactCommand(
                             reason = "BOT_NOT_IN_GUILD";
                         else if (!FindNearbyGuildBank(bot))
                             reason = "GUILD_BANK_NOT_FOUND";
-                        else if (!guild->MemberHasTabRights(
-                                     requester->GetGUID(), 0, GUILD_BANK_RIGHT_DEPOSIT_ITEM) ||
-                                 !guild->MemberHasTabRights(
-                                     bot->GetGUID(), 0, GUILD_BANK_RIGHT_DEPOSIT_ITEM))
-                            reason = "NO_GUILD_BANK_RIGHTS";
                         else
                         {
                             ObjectGuid const sourceGuid = sourceItem->GetGUID();
-                            guild->SwapItemsWithInventory(
-                                bot, false, 0, 255, srcBag, srcSlot, 0);
-
-                            Item* const remaining = bot->GetItemByPos(srcBag, srcSlot);
-                            if (remaining && remaining->GetGUID() == sourceGuid)
-                                reason = "GUILD_BANK_FULL";
-                            else
+                            bool hasAuthorizedTab = false;
+                            if (TryDepositGuildBankStack(
+                                    guild, requester, bot, srcBag, srcSlot, sourceGuid, hasAuthorizedTab))
                                 moved = srcCount;
+                            else
+                                reason = hasAuthorizedTab ? "GUILD_BANK_FULL" : "NO_GUILD_BANK_RIGHTS";
                         }
                     }
                 }
