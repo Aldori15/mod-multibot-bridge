@@ -2150,7 +2150,8 @@ std::string CastProfessionRecipeTarget(Player* bot, uint32 spellId, Item* target
     SpellCastResult const checkResult = spell.CheckCast(true);
     if (checkResult == SPELL_FAILED_BAD_TARGETS ||
         checkResult == SPELL_FAILED_ITEM_ENCHANT_TRADE_WINDOW ||
-        checkResult == SPELL_FAILED_NOT_TRADEABLE)
+        checkResult == SPELL_FAILED_NOT_TRADEABLE ||
+        checkResult == SPELL_FAILED_EQUIPPED_ITEM_CLASS)
     {
         return "INVALID_TARGET_ITEM";
     }
@@ -8327,7 +8328,10 @@ void RunEnchantTradeCommand(Player* requester, ChatMsg replyType, std::string co
             Spell spell(bot, spellInfo, TRIGGERED_FULL_MASK);
             spell.m_targets = targets;
             SpellCastResult const result = spell.CheckCast(true);
-            reason = GetSpellCastFailureReason(result);
+            if (result == SPELL_FAILED_EQUIPPED_ITEM_CLASS)
+                reason = "BAD_TARGET";
+            else
+                reason = GetSpellCastFailureReason(result);
 
             if (result == SPELL_CAST_OK)
             {
