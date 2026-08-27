@@ -366,7 +366,7 @@ Addon  -> Server: MBOT RUN~ITEM_UNEQUIP~<botName>~<token>~<srcSlot>~<srcItemId>
 Server -> Addon:  MBOT INVENTORY_ITEM_UNEQUIP~<botName>~<token>~<status>~<reason>~<srcSlot>~<srcItemId>
 
 Addon  -> Server: MBOT RUN~ITEM_TRADE~<botName>~<token>~<srcBag>~<srcSlot>~<srcItemId>~<srcCount>
-Server -> Addon:  MBOT INVENTORY_ITEM_TRADE~<botName>~<token>~<status>~<reason>~<srcBag>~<srcSlot>~<srcItemId>~<srcCount>
+Server -> Addon:  MBOT INVENTORY_ITEM_TRADE~<botName>~<token>~<status>~<reason>~<srcBag>~<srcSlot>~<srcItemId>~<srcCount>~<tradeSlot>
 
 Addon  -> Server: MBOT RUN~QUEST_ABANDON~<token>~<questId>
 Server -> Addon:  MBOT QUEST_ABANDON_RESULT~<token>~<questId>~<status>~<reason>~<matched>~<abandoned>
