@@ -329,6 +329,19 @@ Server -> Addon:  MBOT FORMATIONS_END~<token>~<sentCount>
 Addon  -> Server: MBOT RUN~STRATEGY~<scope>~<target>~<token>~<stateScope>~<changes>
 Server -> Addon:  MBOT STRATEGY_ACK~<scope>~<target>~<token>~<stateScope>~<matched>~<succeeded>~<failed>~<reason>
 
+Addon  -> Server: MBOT GET~SELF_BOT~<token>
+Server -> Addon:  MBOT SELF_BOT_STATE~<token>~<status>~<0|1>~<reason>
+Addon  -> Server: MBOT RUN~SELF_BOT~<token>~<ENABLE|DISABLE>
+Server -> Addon:  MBOT SELF_BOT_RESULT~<token>~<status>~<0|1>~<reason>
+
+Addon  -> Server: MBOT GET~SELF_STRATEGY_STATE~<token>
+Server -> Addon:  framed STATE_BEGIN / STATE_ITEM / STATE_END packets for the active SelfBot
+Addon  -> Server: MBOT RUN~SELF_STRATEGY~<token>~<C|N>~<encodedChanges>
+Server -> Addon:  MBOT SELF_STRATEGY_ACK~<token>~<C|N>~<OK|ERR>~<reason>
+
+Addon  -> Server: MBOT RUN~SELF_ACTION~<token>~<AUTOGEAR|MAINTENANCE|WAIT_ATTACK_TIME>~<argument>
+Server -> Addon:  MBOT SELF_ACTION_ACK~<token>~<action>~<OK|ERR>~<reason>
+
 Addon  -> Server: MBOT GET~WEAPON_ENCHANT~<botName>~<token>
 Server -> Addon:  MBOT WEAPON_ENCHANT~<token>~<botName>~<status>~<mhItem>~<mhEnchant>~<mhDuration>~<ohItem>~<ohEnchant>~<ohDuration>
 
@@ -352,6 +365,12 @@ Server -> Addon:  MBOT INVENTORY_ITEM_EQUIP~<botName>~<token>~<status>~<reason>~
 Addon  -> Server: MBOT RUN~ITEM_UNEQUIP~<botName>~<token>~<srcSlot>~<srcItemId>
 Server -> Addon:  MBOT INVENTORY_ITEM_UNEQUIP~<botName>~<token>~<status>~<reason>~<srcSlot>~<srcItemId>
 
+Addon  -> Server: MBOT RUN~ITEM_TRADE~<botName>~<token>~<srcBag>~<srcSlot>~<srcItemId>~<srcCount>
+Server -> Addon:  MBOT INVENTORY_ITEM_TRADE~<botName>~<token>~<status>~<reason>~<srcBag>~<srcSlot>~<srcItemId>~<srcCount>~<tradeSlot>
+
+Addon  -> Server: MBOT RUN~QUEST_ABANDON~<token>~<questId>
+Server -> Addon:  MBOT QUEST_ABANDON_RESULT~<token>~<questId>~<status>~<reason>~<matched>~<abandoned>
+
 Addon  -> Server: MBOT GET~ENCHANT_TRADE~<botName>~<token>
 Server -> Addon:  MBOT ENCHANT_TRADE_BEGIN~<botName>~<token>~<status>~<reason>~<skill>~<maxSkill>
 Server -> Addon:  MBOT ENCHANT_TRADE_ITEM~<botName>~<token>~<spellId>~<difficulty>~<available>~<hasTools>~<materialCount>
@@ -360,9 +379,12 @@ Server -> Addon:  MBOT ENCHANT_TRADE_END~<botName>~<token>~<status>~<reason>~<co
 
 Addon  -> Server: MBOT RUN~ENCHANT_TRADE~<botName>~<token>~<spellId>
 Server -> Addon:  MBOT ENCHANT_TRADE_RESULT~<botName>~<token>~<spellId>~<status>~<reason>~<accepted>
+
+Addon  -> Server: MBOT RUN~CRAFT_RECIPE_TARGET~<token>~<encodedBotName>~<skillId>~<spellId>~<targetBag>~<targetSlot>~<targetItemId>
+Server -> Addon:  MBOT CRAFT_RECIPE_TARGET_RESULT~<token>~<encodedBotName>~<status>~<reason>~<skillId>~<spellId>~<targetBag>~<targetSlot>~<targetItemId>
 ```
 
-Current capability negotiation includes `STATE_FRAMING_V1`, `STRATEGY_MUTATION_V1`, `OUTFIT_V1`, `INVENTORY_V1`, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_DESTROY_V1`, `ITEM_USE_V1`, `ITEM_SELL_SINGLE_V1`, `VENDOR_BUYBACK_V1`, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1` and `ENCHANT_TRADE_V1`.
+Current capability negotiation includes `STATE_FRAMING_V1`, `STRATEGY_MUTATION_V1`, `OUTFIT_V1`, `INVENTORY_V1`, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_TRADE_V1`, `ITEM_DEPOSIT_EXACT_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_DESTROY_V1`, `ITEM_USE_V1`, `ITEM_SELL_SINGLE_V1`, `VENDOR_BUYBACK_V1`, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `LOOT_RULE_ITEM_V1`, `QUEST_ABANDON_V1`, `TALENT_APPLY_V1`, `TALENT_SPEC_APPLY_V1`, `CRAFT_RECIPE_TARGET_V1`, `GROUP_ROLL_V1`, `ENCHANT_TRADE_V1`, `SELF_BOT_V1`, `SELF_STRATEGY_V1` and `SELF_ACTION_V1`.
 
 The exact payloads are consumed internally by the MultiBot addon.
 
@@ -393,11 +415,17 @@ The bridge enforces the following input rules before any endpoint is called:
 - `ITEM_UNEQUIP_V1` accepts only an exact equipment slot `0..18` plus positive `itemId`, revalidates Playerbots security, requester/bot sessions, world/alive state and source identity, and captures the source GUID before execution;
 - `ITEM_UNEQUIP_V1` is rate-limited to 8 requests per requester per 2-second window, rejects replayed tokens for 10 seconds, keeps at most 32 recent tokens per requester and bounds requester unequip state to 512 entries;
 - `ITEM_UNEQUIP_V1` uses `CMSG_AUTOSTORE_BAG_ITEM` through the native AzerothCore session handler and reports success only when the same GUID is found outside equipment in an allowed Backpack/Bag 1..4 position; it does not call Playerbots `UnequipAction`, `HandleCommand`, `DoSpecificAction` or a generic chat executor;
+- `ITEM_TRADE_V1` accepts an exact Backpack/Bag inventory source identity, revalidates requester/bot control and runtime Trade state, preserves the native WoW Trade workflow, uses AzerothCore's native trade item handler and returns a structured `INVENTORY_ITEM_TRADE` result; the specialized `ENCHANT_TRADE_V1` service remains separate;
+- `QUEST_ABANDON_V1` accepts only a positive numeric quest ID plus a validated request token, is rate-limited to 4 requests per requester per 2-second window, rejects replayed tokens for 10 seconds, keeps at most 32 recent tokens per requester and bounds requester state to 512 entries;
+- `QUEST_ABANDON_V1` scans only bridge-visible bots in the requester's actual group, revalidates Playerbots security plus session/world state, searches only `MAX_QUEST_LOG_SIZE` slots, invokes the typed `WorldPackets::Quest::QuestLogRemoveQuest` packet through the native session handler and verifies the quest slot postcondition before reporting `QUEST_ABANDON_RESULT`;
 - Group Roll item links are bounded to 160 characters and must contain a valid item-link marker before execution;
 - Group Roll requests are rate-limited per requester (4 requests per 2-second window in the current implementation), and execution is restricted to bridge-visible bots in the requester's actual party/raid with Playerbots security revalidation.
 - Enchant Trade list/run requests are rate-limited per requester (4 requests per 2-second window), require an exact controllable bot name and token, and accept only a positive numeric spell ID for execution.
 - Enchant Trade list framing declares a per-entry material count and 1-based material indexes; the addon rejects missing, duplicate or out-of-range material frames before caching a list.
 - Enchant Trade execution revalidates Playerbots security, active session/state, Enchanting skill, known active Enchanting spell identity, required tools/reagents, the exact current Trade partner and the requester's `TRADE_SLOT_NONTRADED` item before Core spell preparation.
+- `CRAFT_RECIPE_TARGET_V1` accepts only a valid token, exact controllable bot, positive skill/spell/item IDs and one exact `targetBag` / `targetSlot` identity in equipment, Backpack or equipped Bag 1..4; Bank, Keyring and player Trade items are outside this service.
+- Targeted crafting is rate-limited to 4 requests per requester per 2-second window, rejects replayed tokens for 10 seconds, keeps at most 32 recent tokens per requester and bounds requester state to 512 entries.
+- Before execution, targeted crafting revalidates requester/session, Playerbots control/security, bot runtime state, known profession recipe, materials/tools, allowed position and current `itemId`; the item is re-resolved with `GetItemByPos`, passed through `Spell::InitExplicitTargets()` and `CheckCast(true)`, then cast against that exact `Item*`.
 
 Malformed bridge requests are consumed and answered with:
 
@@ -483,7 +511,15 @@ should not be assumed to be generically fragmented by this capability.
   </tr>
   <tr>
     <td><code>GET~TALENT_SPEC_LIST</code></td>
-    <td>Refresh available talent spec templates without automatic chat parsing.</td>
+    <td>Refresh available talent spec templates and return <code>TALENT_SPEC_CURRENT</code> with the authoritative active slot/tree totals, without normal chat parsing.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~TALENT_APPLY</code> / <code>TALENT_APPLY_V1</code></td>
+    <td>Validate and apply one complete custom talent build through the audited Playerbots factory path, then return <code>TALENT_APPLY_RESULT</code> only after authoritative three-tree verification.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~TALENT_SPEC_APPLY</code> / <code>TALENT_SPEC_APPLY_V1</code></td>
+    <td>Apply a server-revalidated premade spec index to talent slot 1 or 2, including dual-spec handling, cast interruption, custom-glyph reset, <code>InitGlyphs(false)</code>, final tree verification and a structured <code>TALENT_SPEC_APPLY_RESULT</code>.</td>
   </tr>
   <tr>
     <td><code>GET~INVENTORY</code> / <code>INVENTORY_V1</code></td>
@@ -506,6 +542,14 @@ should not be assumed to be generically fragmented by this capability.
     <td>Unequip one exact equipment slot/item identity through the native AzerothCore auto-store path, validate the same item GUID in an allowed inventory position after execution and return a structured <code>INVENTORY_ITEM_UNEQUIP</code> result.</td>
   </tr>
   <tr>
+    <td><code>RUN~ITEM_TRADE</code> / <code>ITEM_TRADE_V1</code></td>
+    <td>Trade one exact inventory source through the native WoW Trade workflow after server-side control/source/runtime revalidation, using the native AzerothCore trade item handler and a structured <code>INVENTORY_ITEM_TRADE</code> result. This capability is distinct from <code>ENCHANT_TRADE_V1</code>.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~QUEST_ABANDON</code> / <code>QUEST_ABANDON_V1</code></td>
+    <td>Abandon one numeric quest ID for authorized bridge-visible bots in the requester's actual group, using bounded quest-slot lookup, the typed AzerothCore <code>QuestLogRemoveQuest</code> client packet, native session handling and a structured <code>QUEST_ABANDON_RESULT</code> response.</td>
+  </tr>
+  <tr>
     <td><code>RUN~ITEM_USE</code> / <code>ITEM_USE_V1</code></td>
     <td>Use one item from an exact physical inventory source after server-side identity/runtime revalidation, execute through the native use-item handler and return a structured <code>INVENTORY_ITEM_USE</code> result.</td>
   </tr>
@@ -523,7 +567,7 @@ should not be assumed to be generically fragmented by this capability.
   </tr>
   <tr>
     <td><code>RUN~ITEM_ACTION</code> — <code>SELL_VENDOR</code> / <code>SELL_GREY</code></td>
-    <td>Run bounded bulk-sell actions after bot/security/rate-limit validation. <code>SELL_VENDOR</code> is the normal bridge-first Sell Vendor path; further SELL_GREY project work is explicitly deferred.</td>
+    <td>Run bounded bulk-sell actions after bot/security/rate-limit validation. <code>SELL_VENDOR</code> is the normal bridge-first Sell Vendor path and accepts <code>ITEM_USAGE_VENDOR</code> only; <code>ITEM_USAGE_AH</code> is explicitly excluded from this action. The Addon legacy <code>s vendor</code> path is reachable only when <code>MultiBot.allowLegacyChatFallback == true</code>. Further SELL_GREY project work is explicitly deferred.</td>
   </tr>
   <tr>
     <td><code>RUN~ITEM_ACTION</code> — <code>OPEN_ITEMS</code></td>
@@ -544,6 +588,10 @@ should not be assumed to be generically fragmented by this capability.
   <tr>
     <td><code>GET~GBANK</code></td>
     <td>Refresh the bot guild bank snapshot and withdrawal-rights state without requiring the player to be in the same guild.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~ITEM_DEPOSIT_EXACT</code></td>
+    <td>Execute negotiated <code>ITEM_DEPOSIT_EXACT_V1</code> whole-stack <code>BANK_DEPOSIT</code> or <code>GBANK_DEPOSIT</code> from an exact bot inventory <code>bag/slot/itemId/count</code> source. The bridge revalidates source identity before mutation, rejects stale state with <code>SOURCE_STALE</code>, validates the relevant bank/guild-bank context and applies bounded rate/replay state.</td>
   </tr>
   <tr>
     <td><code>GET~SPELLBOOK</code></td>
@@ -587,11 +635,15 @@ should not be assumed to be generically fragmented by this capability.
   </tr>
   <tr>
     <td><code>RUN~CRAFT_RECIPE</code></td>
-    <td>Ask a bot to craft one known profession recipe and return detailed cast failure reasons.</td>
+    <td>Ask a bot to craft one known profession recipe and return detailed cast failure reasons. Recipes requiring an exact item target return <code>TARGET_REQUIRED</code> instead of using an ambiguous implicit item target.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~CRAFT_RECIPE_TARGET</code> / <code>CRAFT_RECIPE_TARGET_V1</code></td>
+    <td>Apply one validated item-target profession recipe to an exact bot-owned equipment/Backpack/Bag 1..4 item identified by <code>bag/slot/itemId</code>, after server-side recipe/material/tool/target revalidation, and return <code>CRAFT_RECIPE_TARGET_RESULT</code>.</td>
   </tr>
   <tr>
     <td><code>RUN~ITEM_ACTION</code></td>
-    <td>Run whitelisted inventory actions including bank deposit/withdraw, guild bank deposit/withdraw, vendor buy, bulk sell and residual open-items operations. Each action has endpoint-specific validation; this is not a generic item-command executor.</td>
+    <td>Run whitelisted compatibility/residual inventory actions including current bank/guild-bank withdrawals, vendor buy, bulk sell and residual open-items operations. Exact BANK/GBANK deposits use the specialized negotiated <code>ITEM_DEPOSIT_EXACT_V1</code> service when supported. The generic action path remains for backward compatibility and is not a generic item-command executor.</td>
   </tr>
   <tr>
     <td><code>RUN~OUTFIT</code></td>
@@ -622,8 +674,12 @@ should not be assumed to be generically fragmented by this capability.
     <td>Apply bounded structured <code>co/nc</code> strategy mutations, verify the resulting bot strategy state, and return matched/succeeded/failed counts plus a structured reason.</td>
   </tr>
   <tr>
+    <td><code>RUN~LOOT_RULE_ITEM</code> / <code>LOOT_RULE_ITEM_RESULT</code></td>
+    <td>Execute negotiated <code>LOOT_RULE_ITEM_V1</code> exact always-loot ADD/REMOVE for one validated <code>itemId</code>. The bridge supports strict <code>ALL</code>/<code>RAID</code>/<code>GROUP</code>/<code>PARTY</code>/<code>BOT</code> scopes, prevalidates every selected bot before mutation, caps a request at 128 bots, persists only changed bots and enforces the global persistence budget before mutation.</td>
+  </tr>
+  <tr>
     <td><code>RUN~LOOT</code></td>
-    <td>Run whitelist-only loot rules and loot list commands without addon-side chat parsing.</td>
+    <td>Run whitelist-only loot enable/disable and verified loot-list profile operations without addon-side chat parsing. Historical Quest/Skill wording is not treated as proof of a current Playerbots capability and is tracked separately from <code>LOOT_RULE_ITEM_V1</code>.</td>
   </tr>
 </table>
 
@@ -657,6 +713,14 @@ Discovery responses are capped at 256 enchantment entries. `ENCHANT_TRADE_END` r
 
 Runtime validation on 2026-08-14 confirmed list retrieval, reagent/tool status, native Trade-window targeting and a real item enchant. No generic Playerbots command/cast executor or automatic chat path is exposed by this capability.
 
+## Targeted Profession Recipe Service
+
+`CRAFT_RECIPE_TARGET_V1` is the specialized continuation for known profession recipes whose spell requires an exact item target. Ordinary recipes remain on `RUN~CRAFT_RECIPE`; after normal recipe validation, an item-target recipe returns `TARGET_REQUIRED` rather than falling back to the historical ambiguous `"item for spell"` resolution.
+
+The targeted request carries only `skillId`, `spellId` and the bot-owned `bag/slot/itemId` identity selected by the addon. The bridge allows equipment, Backpack and equipped Bag 1..4 positions only, re-resolves the current `Item*`, verifies the item entry has not gone stale, revalidates recipe/material/tool requirements and performs explicit Core target checking before the exact item cast. Bank, Keyring and player Trade items are deliberately outside this capability.
+
+`CRAFT_RECIPE_TARGET_V1` is distinct from `ENCHANT_TRADE_V1`: the former targets an item owned by the bot, while the latter targets the requester's native `TRADE_SLOT_NONTRADED` item. Runtime validation on 2026-08-21 confirmed ordinary crafting and a real exact-item targeted enchant with no observed automatic chat spam.
+
 ## Warlock strategy selectors and stone switching
 
 The migrated Warlock Stones, Soulstones, Pets and Curses selectors use `RUN~STRATEGY` rather than direct automatic selector whispers. The bridge verifies strategy mutations before returning `STRATEGY_ACK`, allowing the addon to refresh selector state from authoritative server `STATE` data.
@@ -679,13 +743,22 @@ The endpoint and switching implementation remain present, while the project's fi
 
 # Current Development Baseline
 
-Documentation synchronized on **2026-08-17** against the validated Jellypowered bridge-first inventory work and pre-merge stabilization state.
+Documentation synchronized on **2026-08-25** after closure of P3A `ITEM_DEPOSIT_EXACT_V1` and `LOOT_RULE_ITEM_V1` on `jellypowered-chatless-integration-v2`. The branch was originally created directly from the post-merge Jellypowered + SelfBot `main` baseline. Its current v2 functional batch is complete; after this final documentation commit/push, the branch is intended for PR to `main`, with subsequent normal-roadmap work restarting from a new branch based on the updated `main`.
 
-Recent bridge-first milestones include `OUTFIT_V1`, `INVENTORY_V1`, hardened bank/guild-bank/vendor-buy item actions, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1`, the runtime-validated `ENCHANT_TRADE_V1` Enchanting Trade Service, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_USE_V1`, the specialized `ITEM_DESTROY` path, `ITEM_SELL_SINGLE_V1` and `VENDOR_BUYBACK_V1`.
+The Jellypowered bridge work is already merged into `main` through PR #28, merge commit `5e5ff7594ec8afedf40926605a60848dbc14991e`. Recent bridge-first milestones include `OUTFIT_V1`, `INVENTORY_V1`, hardened bank/guild-bank/vendor-buy item actions, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1`, the runtime-validated `ENCHANT_TRADE_V1` Enchanting Trade Service, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_TRADE_V1`, `ITEM_USE_V1`, the specialized `ITEM_DESTROY` path, `ITEM_SELL_SINGLE_V1`, `VENDOR_BUYBACK_V1`, `QUEST_ABANDON_V1`, `TALENT_APPLY_V1`, `TALENT_SPEC_APPLY_V1`, the runtime-validated `CRAFT_RECIPE_TARGET_V1` targeted profession path, P3A `ITEM_DEPOSIT_EXACT_V1` for exact physical BANK/GBANK deposits and `LOOT_RULE_ITEM_V1` for exact persistent always-loot item ADD/REMOVE.
 
-`INVENTORY_EXACT_V1` exposes exact Backpack, equipped-bag and Keyring topology for the bag-aware addon UI. Exact move/equip/unequip/use/single-sell and Buyback flows revalidate server-side state and wait for structured authoritative results; no generic Playerbots command/chat executor is exposed. Pre-merge stabilization has also closed CAPS wire-budget handling, whole-stack move and quest-start use postconditions, explicit INVENTORY_EXACT authorization, Equip fallback gating, inventory frame recycling, cold-cache safety, ITEM_USE/Inspect localization, the Buyback nil-frame guard and the unused `BUYBACK_ROWS` LuaLint warning. Global LuaLint/CI checks still remain to be executed before merge.
+`INVENTORY_EXACT_V1` exposes exact Backpack, equipped-bag and Keyring topology for the bag-aware addon UI. `ITEM_MOVE_V1` already supports whole-stack moves between allowed Backpack / Bag 1..4 / Keyring physical slots, including inter-container moves. It does **not** authorize the equipped bag slots themselves; any future `BAG_MOVE` work therefore concerns moving/re-equipping bag objects, not ordinary inventory items. `ITEM_TRADE_V1` now provides generic exact-item Trade through the native WoW Trade flow and was runtime validated in both directions; it remains distinct from the specialized `ENCHANT_TRADE_V1` service. `ITEM_DEPOSIT_EXACT_V1` consumes an exact inventory `bag/slot/itemId/count` identity for whole-stack `BANK_DEPOSIT` and `GBANK_DEPOSIT`, revalidates the physical source immediately before mutation, rejects stale state with `SOURCE_STALE`, and is bounded to 8 requests per requester per 2 seconds with 10-second replay protection, 32 recent tokens and 512 requester states. Runtime validation confirmed that only the selected physical stack moves for BANK and GBANK and that a deliberately stale count leaves the real stack unchanged. Exact BANK/GBANK withdrawals remain deferred because their current read models do not expose a physical source stack end to end. `QUEST_ABANDON_V1` uses the typed AzerothCore Quest packet/session path and was runtime validated with one controlled bot with no chat spam; the mixed multi-bot runtime case is explicitly deferred until suitable bots are available. Quest sharing remains a native client behavior through `QuestLogPushQuest()` and therefore does not require a `QUEST_SHARE_V1` bridge capability. Exact move/equip/unequip/trade/use/single-sell/Buyback/deposit/quest-abandon flows revalidate server-side state and wait for structured authoritative results; no generic Playerbots command/chat executor is exposed.
 
-The next normal roadmap item remains **item-specific loot-rule add/remove**. Deferred work that must not interrupt that sequence includes the SELL_GREY/core-API follow-up and final Firestone/Spellstone TEMP_ENCHANT revalidation.
+`LOOT_RULE_ITEM_V1` mutates only the audited Playerbots `always loot list` value for an exact validated `itemId`; it does not expose a generic Playerbots command executor. The service supports strict `ALL`, `RAID`, `GROUP`, `PARTY` and `BOT` scopes and prevalidates requester/session/world state, scope/target, visible controllable bots, Playerbots security, bot session/world/alive/context and the item template before the first mutation. A request is capped at 128 matched bots, bounded to 8 requests per requester per 2 seconds, protected by a 10-second replay window with 32 recent tokens and 512 requester states, and returns structured `ADDED`, `REMOVED`, `ALREADY_PRESENT`, `ALREADY_ABSENT`, `PARTIAL` or error reasons. Persistence is performed only for bots whose list actually changes. A global server budget of 128 bot saves per 10 seconds is reserved before mutation; insufficient capacity returns `PERSISTENCE_BUSY` with no mutation. Runtime validation confirmed ADD/REMOVE idempotence, invalid-item rejection, persistence through disconnect/reconnect and full worldserver restart, localized Addon results and no chat/whisper spam.
+
+`TALENT_APPLY_V1` applies the editable custom talent tree through strict class/DBC/point validation and the audited Playerbots talent factory path, then verifies the actual three tree totals before returning success. `TALENT_SPEC_APPLY_V1` extends the existing premade-list transport with `TALENT_SPEC_CURRENT` and a structured apply operation by server-side spec index. Slot 1 and slot 2/dual-spec were compiled and runtime validated on 2026-08-21; the path reproduces cast interruption, validates/creates dual spec where eligible, clears `custom_glyphs`, runs `InitGlyphs(false)`, verifies final tree totals and resets strategies only after successful verification. Normal operation therefore does not need the historical talent-related whispers.
+The separate SelfBot work is also already merged into `main` through PR #30 **Complete SelfBot chatless bridge support**. The current bridge advertises `SELF_BOT_V1`, `SELF_STRATEGY_V1` and `SELF_ACTION_V1`. SelfBot residual findings such as `dps aoe` canonicalization and deferred Warlock rollback robustness remain outside the Jellypowered scope.
+
+`TALENT_APPLY_V1`, `TALENT_SPEC_APPLY_V1`, `CRAFT_RECIPE_TARGET_V1`, P3A `ITEM_DEPOSIT_EXACT_V1` and `LOOT_RULE_ITEM_V1` are complete and runtime validated.
+
+`SELL_VENDOR` safety hardening was completed and runtime revalidated on 2026-08-23 at Bridge commit `3ccf5047f7994218b742312fe1437f4b303f7159` paired with Addon commit `fe2c807785219b82ca885f1a95d7c1dc27f0eed0`. The Bridge now accepts `ITEM_USAGE_VENDOR` only for `SELL_VENDOR` and explicitly excludes `ITEM_USAGE_AH`; runtime regression testing confirmed Symbol of Kings and Gold Ore are preserved while vendor selling remains functional. The Addon keeps the historical `s vendor` path only behind `MultiBot.allowLegacyChatFallback == true`.
+
+The bank / guild-bank comparison is closed for the current roadmap with P3A `ITEM_DEPOSIT_EXACT_V1`, and the following exact loot-rule item work is now closed with `LOOT_RULE_ITEM_V1`. P3B exact BANK withdrawal and P3C exact GBANK withdrawal remain explicitly deferred because their current snapshots do not expose a selectable physical source stack end to end. The generic `SOURCE_STALE` UI text and equipped-bag reassignment remain low-priority residuals. After the final docs commit and PR of this Jellypowered v2 batch, the normal roadmap resumes on a new post-merge branch with the Quest/Skill versus Disenchant decision based on verified Playerbots code; deferred P3B/P3C, SELL_GREY/core-API follow-up and final Firestone/Spellstone TEMP_ENCHANT revalidation must not interrupt that sequence.
 
 
 ---
@@ -945,3 +1018,16 @@ bounded per-requester rate limit.
 The addon updates the SelfBot button from structured server responses. The
 historical `.playerbot bot self` chat command is used only when
 `MultiBot.allowLegacyChatFallback == true`.
+
+### SELF_STRATEGY_V1
+
+`SELF_STRATEGY_V1` is restricted to the requesting player's active SelfBot. `GET~SELF_STRATEGY_STATE` returns the SelfBot's current strategy state through the existing framed `STATE_BEGIN` / `STATE_ITEM` / `STATE_END` machinery. `RUN~SELF_STRATEGY` accepts only `C` or `N` state scope plus the shared strict strategy-mutation syntax, then applies a server-side class/state allowlist before mutating the SelfBot. Completion is returned through `SELF_STRATEGY_ACK`.
+
+This capability does not target arbitrary bots and does not expose arbitrary strategy names. The existing deferred Warlock stone switching guard remains part of this SelfBot strategy path; its separately identified rollback-hardening residual is not part of Jellypowered work.
+
+### SELF_ACTION_V1
+
+`SELF_ACTION_V1` is a narrow SelfBot-only action surface. The Bridge accepts only `AUTOGEAR`, `MAINTENANCE` and `WAIT_ATTACK_TIME`; `WAIT_ATTACK_TIME` accepts only `0`, `3`, `5` or `10`. Requests require an active SelfBot, PlayerbotAI/security checks and bounded rate limits, with heavier throttling for Autogear and Maintenance. Results are returned through `SELF_ACTION_ACK`.
+
+This capability does not make normal-bot Maintenance or Autogear paths chatless automatically. Those paths must continue to be classified/migrated independently where legacy chat is still present.
+
