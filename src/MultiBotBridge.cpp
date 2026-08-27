@@ -6187,8 +6187,33 @@ bool ConsumeTalentApplyRateLimit(Player* requester)
 
     std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
     std::string const key = requester->GetName();
-    TalentApplyRateState& state = sTalentApplyRateStates[key];
+    auto stateIt = sTalentApplyRateStates.find(key);
 
+    if (stateIt == sTalentApplyRateStates.end())
+    {
+        if (sTalentApplyRateStates.size() >= kTalentApplyMaxRequesterStates)
+        {
+            for (auto it = sTalentApplyRateStates.begin(); it != sTalentApplyRateStates.end();)
+            {
+                while (!it->second.requests.empty() && now - it->second.requests.front() >= kTalentApplyRateWindow)
+                    it->second.requests.pop_front();
+                while (!it->second.recentTokens.empty() && now - it->second.recentTokens.front().second >= kTalentApplyReplayTtl)
+                    it->second.recentTokens.pop_front();
+
+                if (it->second.requests.empty() && it->second.recentTokens.empty())
+                    it = sTalentApplyRateStates.erase(it);
+                else
+                    ++it;
+            }
+        }
+
+        if (sTalentApplyRateStates.size() >= kTalentApplyMaxRequesterStates)
+            return false;
+
+        stateIt = sTalentApplyRateStates.emplace(key, TalentApplyRateState{}).first;
+    }
+
+    TalentApplyRateState& state = stateIt->second;
     while (!state.requests.empty() && now - state.requests.front() >= kTalentApplyRateWindow)
         state.requests.pop_front();
 
@@ -6196,23 +6221,6 @@ bool ConsumeTalentApplyRateLimit(Player* requester)
         return false;
 
     state.requests.push_back(now);
-
-    if (sTalentApplyRateStates.size() > kTalentApplyMaxRequesterStates)
-    {
-        for (auto it = sTalentApplyRateStates.begin(); it != sTalentApplyRateStates.end();)
-        {
-            while (!it->second.requests.empty() && now - it->second.requests.front() >= kTalentApplyRateWindow)
-                it->second.requests.pop_front();
-            while (!it->second.recentTokens.empty() && now - it->second.recentTokens.front().second >= kTalentApplyReplayTtl)
-                it->second.recentTokens.pop_front();
-
-            if (it->second.requests.empty() && it->second.recentTokens.empty() && it->first != key)
-                it = sTalentApplyRateStates.erase(it);
-            else
-                ++it;
-        }
-    }
-
     return true;
 }
 
@@ -6223,8 +6231,11 @@ bool RegisterTalentApplyToken(Player* requester, std::string const& token)
 
     std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
     std::string const key = requester->GetName();
-    TalentApplyRateState& state = sTalentApplyRateStates[key];
+    auto stateIt = sTalentApplyRateStates.find(key);
+    if (stateIt == sTalentApplyRateStates.end())
+        return false;
 
+    TalentApplyRateState& state = stateIt->second;
     while (!state.recentTokens.empty() && now - state.recentTokens.front().second >= kTalentApplyReplayTtl)
         state.recentTokens.pop_front();
 
@@ -6448,8 +6459,33 @@ bool ConsumeTalentSpecApplyRateLimit(Player* requester)
 
     std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
     std::string const key = requester->GetName();
-    TalentSpecApplyRateState& state = sTalentSpecApplyRateStates[key];
+    auto stateIt = sTalentSpecApplyRateStates.find(key);
 
+    if (stateIt == sTalentSpecApplyRateStates.end())
+    {
+        if (sTalentSpecApplyRateStates.size() >= kTalentSpecApplyMaxRequesterStates)
+        {
+            for (auto it = sTalentSpecApplyRateStates.begin(); it != sTalentSpecApplyRateStates.end();)
+            {
+                while (!it->second.requests.empty() && now - it->second.requests.front() >= kTalentSpecApplyRateWindow)
+                    it->second.requests.pop_front();
+                while (!it->second.recentTokens.empty() && now - it->second.recentTokens.front().second >= kTalentSpecApplyReplayTtl)
+                    it->second.recentTokens.pop_front();
+
+                if (it->second.requests.empty() && it->second.recentTokens.empty())
+                    it = sTalentSpecApplyRateStates.erase(it);
+                else
+                    ++it;
+            }
+        }
+
+        if (sTalentSpecApplyRateStates.size() >= kTalentSpecApplyMaxRequesterStates)
+            return false;
+
+        stateIt = sTalentSpecApplyRateStates.emplace(key, TalentSpecApplyRateState{}).first;
+    }
+
+    TalentSpecApplyRateState& state = stateIt->second;
     while (!state.requests.empty() && now - state.requests.front() >= kTalentSpecApplyRateWindow)
         state.requests.pop_front();
 
@@ -6457,23 +6493,6 @@ bool ConsumeTalentSpecApplyRateLimit(Player* requester)
         return false;
 
     state.requests.push_back(now);
-
-    if (sTalentSpecApplyRateStates.size() > kTalentSpecApplyMaxRequesterStates)
-    {
-        for (auto it = sTalentSpecApplyRateStates.begin(); it != sTalentSpecApplyRateStates.end();)
-        {
-            while (!it->second.requests.empty() && now - it->second.requests.front() >= kTalentSpecApplyRateWindow)
-                it->second.requests.pop_front();
-            while (!it->second.recentTokens.empty() && now - it->second.recentTokens.front().second >= kTalentSpecApplyReplayTtl)
-                it->second.recentTokens.pop_front();
-
-            if (it->second.requests.empty() && it->second.recentTokens.empty() && it->first != key)
-                it = sTalentSpecApplyRateStates.erase(it);
-            else
-                ++it;
-        }
-    }
-
     return true;
 }
 
@@ -6484,8 +6503,11 @@ bool RegisterTalentSpecApplyToken(Player* requester, std::string const& token)
 
     std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
     std::string const key = requester->GetName();
-    TalentSpecApplyRateState& state = sTalentSpecApplyRateStates[key];
+    auto stateIt = sTalentSpecApplyRateStates.find(key);
+    if (stateIt == sTalentSpecApplyRateStates.end())
+        return false;
 
+    TalentSpecApplyRateState& state = stateIt->second;
     while (!state.recentTokens.empty() && now - state.recentTokens.front().second >= kTalentSpecApplyReplayTtl)
         state.recentTokens.pop_front();
 
