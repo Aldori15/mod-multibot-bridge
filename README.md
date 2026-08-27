@@ -679,7 +679,7 @@ should not be assumed to be generically fragmented by this capability.
   </tr>
   <tr>
     <td><code>RUN~LOOT</code></td>
-    <td>Run whitelist-only loot enable/disable and verified loot-list profile operations without addon-side chat parsing. Historical Quest/Skill wording is not treated as proof of a current Playerbots capability and is tracked separately from <code>LOOT_RULE_ITEM_V1</code>.</td>
+    <td>Run whitelist-only loot enable/disable and verified loot-list profile operations without addon-side chat parsing. Historical Quest/Skill wording is not treated as proof of a current Playerbots capability. The audited profile decision is closed: <code>disenchant</code> is retained, while Quest/Skill are not exposed as validated loot profiles; exact always-loot item mutation remains a separate <code>LOOT_RULE_ITEM_V1</code> capability.</td>
   </tr>
 </table>
 
@@ -743,7 +743,7 @@ The endpoint and switching implementation remain present, while the project's fi
 
 # Current Development Baseline
 
-Documentation synchronized on **2026-08-25** after closure of P3A `ITEM_DEPOSIT_EXACT_V1` and `LOOT_RULE_ITEM_V1` on `jellypowered-chatless-integration-v2`. The branch was originally created directly from the post-merge Jellypowered + SelfBot `main` baseline. Its current v2 functional batch is complete; after this final documentation commit/push, the branch is intended for PR to `main`, with subsequent normal-roadmap work restarting from a new branch based on the updated `main`.
+Documentation synchronized on **2026-08-27** after closure of the Quest/Skill versus Disenchant decision on `feature/loot-disenchant-mainbar`. The historical `jellypowered-chatless-integration-v2` line remains baseline context only. The current Addon and Bridge development remains on `feature/loot-disenchant-mainbar`; the current change retains the verified Playerbots `disenchant` loot profile, removes Quest/Skill from the bridge loot whitelist, and keeps the next normal-roadmap work focused on auditing collective `follow` / `attack` / `stay` selectors.
 
 The Jellypowered bridge work is already merged into `main` through PR #28, merge commit `5e5ff7594ec8afedf40926605a60848dbc14991e`. Recent bridge-first milestones include `OUTFIT_V1`, `INVENTORY_V1`, hardened bank/guild-bank/vendor-buy item actions, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1`, the runtime-validated `ENCHANT_TRADE_V1` Enchanting Trade Service, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_TRADE_V1`, `ITEM_USE_V1`, the specialized `ITEM_DESTROY` path, `ITEM_SELL_SINGLE_V1`, `VENDOR_BUYBACK_V1`, `QUEST_ABANDON_V1`, `TALENT_APPLY_V1`, `TALENT_SPEC_APPLY_V1`, the runtime-validated `CRAFT_RECIPE_TARGET_V1` targeted profession path, P3A `ITEM_DEPOSIT_EXACT_V1` for exact physical BANK/GBANK deposits and `LOOT_RULE_ITEM_V1` for exact persistent always-loot item ADD/REMOVE.
 
@@ -758,7 +758,7 @@ The separate SelfBot work is also already merged into `main` through PR #30 **Co
 
 `SELL_VENDOR` safety hardening was completed and runtime revalidated on 2026-08-23 at Bridge commit `3ccf5047f7994218b742312fe1437f4b303f7159` paired with Addon commit `fe2c807785219b82ca885f1a95d7c1dc27f0eed0`. The Bridge now accepts `ITEM_USAGE_VENDOR` only for `SELL_VENDOR` and explicitly excludes `ITEM_USAGE_AH`; runtime regression testing confirmed Symbol of Kings and Gold Ore are preserved while vendor selling remains functional. The Addon keeps the historical `s vendor` path only behind `MultiBot.allowLegacyChatFallback == true`.
 
-The bank / guild-bank comparison is closed for the current roadmap with P3A `ITEM_DEPOSIT_EXACT_V1`, and the following exact loot-rule item work is now closed with `LOOT_RULE_ITEM_V1`. P3B exact BANK withdrawal and P3C exact GBANK withdrawal remain explicitly deferred because their current snapshots do not expose a selectable physical source stack end to end. The generic `SOURCE_STALE` UI text and equipped-bag reassignment remain low-priority residuals. After the final docs commit and PR of this Jellypowered v2 batch, the normal roadmap resumes on a new post-merge branch with the Quest/Skill versus Disenchant decision based on verified Playerbots code; deferred P3B/P3C, SELL_GREY/core-API follow-up and final Firestone/Spellstone TEMP_ENCHANT revalidation must not interrupt that sequence.
+The bank / guild-bank comparison is closed for the current roadmap with P3A `ITEM_DEPOSIT_EXACT_V1`, and the following exact loot-rule item work is closed with `LOOT_RULE_ITEM_V1`. P3B exact BANK withdrawal and P3C exact GBANK withdrawal remain explicitly deferred because their current snapshots do not expose a selectable physical source stack end to end. The Quest/Skill versus Disenchant decision is now closed from verified Playerbots code: `disenchant` is retained and Quest/Skill are not exposed as validated loot profiles. The next normal-roadmap work is the targeted selector audit for collective `follow` / `attack` / `stay`; deferred P3B/P3C, SELL_GREY/core-API follow-up and final Firestone/Spellstone TEMP_ENCHANT revalidation must not interrupt that sequence.
 
 
 ---
