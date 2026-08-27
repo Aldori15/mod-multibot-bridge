@@ -1329,6 +1329,189 @@ std::string GetPremadeSpecLink(uint8 classId, uint32 specIndex, uint32 botLevel)
     return "";
 }
 
+// MB_TALENT_SPEC_LEVEL_ADJUSTED_VERIFY_V1_BEGIN
+void SimulateTalentSpecLearn(
+    Player* bot,
+    TalentEntry const* talent,
+    uint32 talentRank,
+    uint32& freePoints,
+    std::map<uint32, uint32>& currentRanks,
+    std::map<uint32, uint32>& pointsByTalentTab,
+    std::array<uint32, 3>& expectedTabs)
+{
+    if (!bot || !talent || !freePoints || talentRank >= MAX_TALENT_RANK)
+        return;
+
+    TalentTabEntry const* const tabInfo = sTalentTabStore.LookupEntry(talent->TalentTab);
+    if (!tabInfo || tabInfo->tabpage >= expectedTabs.size() ||
+        !(tabInfo->ClassMask & bot->getClassMask()))
+    {
+        return;
+    }
+
+    uint32 const currentRank = currentRanks[talent->TalentID];
+    uint32 const targetRank = talentRank + 1;
+    if (currentRank >= targetRank)
+        return;
+
+    uint32 const pointCost = targetRank - currentRank;
+    if (freePoints < pointCost)
+        return;
+
+    if (talent->DependsOn > 0)
+    {
+        if (TalentEntry const* const dependency = sTalentStore.LookupEntry(talent->DependsOn))
+        {
+            uint32 const dependencyRank = currentRanks[dependency->TalentID];
+            if (dependencyRank <= talent->DependsOnRank)
+                return;
+        }
+    }
+
+    if (talent->Row > 0 &&
+        pointsByTalentTab[talent->TalentTab] < talent->Row * MAX_TALENT_RANK)
+    {
+        return;
+    }
+
+    uint32 const spellId = talent->RankID[talentRank];
+    if (!spellId || !sSpellMgr->GetSpellInfo(spellId))
+        return;
+
+    currentRanks[talent->TalentID] = targetRank;
+    pointsByTalentTab[talent->TalentTab] += pointCost;
+    expectedTabs[tabInfo->tabpage] += pointCost;
+    freePoints -= pointCost;
+}
+
+bool BuildLevelAdjustedTalentSpecTabs(
+    Player* bot,
+    uint32 specIndex,
+    std::array<uint32, 3>& expectedTabs)
+{
+    expectedTabs = {0, 0, 0};
+
+    if (!bot || specIndex >= MAX_SPECNO)
+        return false;
+
+    uint32 const classId = bot->getClass();
+    if (classId >= MAX_CLASSES)
+        return false;
+
+    uint32 freePoints = bot->CalculateTalentsPoints();
+    if (!freePoints)
+        return false;
+
+    std::map<uint32, TalentEntry const*> talentsByPosition;
+    uint32 const classMask = bot->getClassMask();
+    for (uint32 index = 0; index < sTalentStore.GetNumRows(); ++index)
+    {
+        TalentEntry const* const talent = sTalentStore.LookupEntry(index);
+        if (!talent)
+            continue;
+
+        TalentTabEntry const* const tabInfo = sTalentTabStore.LookupEntry(talent->TalentTab);
+        if (!tabInfo || tabInfo->tabpage >= expectedTabs.size() ||
+            !(tabInfo->ClassMask & classMask))
+        {
+            continue;
+        }
+
+        uint32 const positionKey =
+            (static_cast<uint32>(tabInfo->tabpage) << 16) |
+            (static_cast<uint32>(talent->Row) << 8) |
+            static_cast<uint32>(talent->Col);
+        talentsByPosition[positionKey] = talent;
+    }
+
+    std::map<uint32, uint32> currentRanks;
+    std::map<uint32, uint32> pointsByTalentTab;
+
+    int startLevel = static_cast<int>(bot->GetLevel());
+    while (startLevel > 1 && startLevel < 80 &&
+           sPlayerbotAIConfig.parsedSpecLinkOrder[classId][specIndex][startLevel].empty())
+    {
+        --startLevel;
+    }
+
+    bool sawTemplate = false;
+    for (int level = startLevel; level <= 80 && freePoints; ++level)
+    {
+        std::vector<std::vector<uint32>> const& order =
+            sPlayerbotAIConfig.parsedSpecLinkOrder[classId][specIndex][level];
+        if (order.empty())
+            continue;
+
+        sawTemplate = true;
+        for (std::vector<uint32> const& parsedTalent : order)
+        {
+            if (parsedTalent.size() != 4 ||
+                parsedTalent[0] >= expectedTabs.size() ||
+                !parsedTalent[3])
+            {
+                return false;
+            }
+
+            uint32 const positionKey =
+                (parsedTalent[0] << 16) |
+                (parsedTalent[1] << 8) |
+                parsedTalent[2];
+
+            auto const talentIt = talentsByPosition.find(positionKey);
+            if (talentIt == talentsByPosition.end())
+                return false;
+
+            TalentEntry const* const talent = talentIt->second;
+
+            if (talent->DependsOn && freePoints)
+            {
+                if (TalentEntry const* const dependency =
+                        sTalentStore.LookupEntry(talent->DependsOn))
+                {
+                    uint32 const dependencyRank =
+                        std::min<uint32>(talent->DependsOnRank, freePoints - 1);
+                    SimulateTalentSpecLearn(
+                        bot,
+                        dependency,
+                        dependencyRank,
+                        freePoints,
+                        currentRanks,
+                        pointsByTalentTab,
+                        expectedTabs);
+                }
+            }
+
+            if (!freePoints)
+                break;
+
+            uint32 const talentRank =
+                std::min<uint32>(parsedTalent[3], freePoints) - 1;
+            SimulateTalentSpecLearn(
+                bot,
+                talent,
+                talentRank,
+                freePoints,
+                currentRanks,
+                pointsByTalentTab,
+                expectedTabs);
+
+            if (!freePoints)
+                break;
+        }
+    }
+
+    return sawTemplate &&
+        (expectedTabs[0] + expectedTabs[1] + expectedTabs[2]) > 0;
+}
+
+std::string FormatTalentSpecPointSummary(std::array<uint32, 3> const& tabs)
+{
+    std::ostringstream summary;
+    summary << tabs[0] << '-' << tabs[1] << '-' << tabs[2];
+    return summary.str();
+}
+// MB_TALENT_SPEC_LEVEL_ADJUSTED_VERIFY_V1_END
+
 std::vector<TalentSpecEntryData> BuildTalentSpecEntries(Player* bot)
 {
     std::vector<TalentSpecEntryData> entries;
@@ -1351,8 +1534,13 @@ std::vector<TalentSpecEntryData> BuildTalentSpecEntries(Player* bot)
         entry.name = specName;
 
         std::string const link = GetPremadeSpecLink(classId, specIndex, bot->GetLevel());
-        if (!link.empty())
-            entry.build = BuildTalentLinkPointSummary(link);
+        std::array<uint32, 3> levelAdjustedTabs = {0, 0, 0};
+        if (!link.empty() &&
+            !BuildTalentLinkPointSummary(link).empty() &&
+            BuildLevelAdjustedTalentSpecTabs(bot, specIndex, levelAdjustedTabs))
+        {
+            entry.build = FormatTalentSpecPointSummary(levelAdjustedTabs);
+        }
 
         entries.push_back(entry);
     }
