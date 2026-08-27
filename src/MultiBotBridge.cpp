@@ -8890,8 +8890,7 @@ bool IsAllowedLootCommand(std::string const& command)
         "ll all",
         "ll normal",
         "ll gray",
-        "ll quest",
-        "ll skill"
+        "ll disenchant"
     };
 
     return allowed.find(Trim(command)) != allowed.end();
