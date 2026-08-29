@@ -172,7 +172,7 @@ std::chrono::milliseconds constexpr kBotLifecycleRateWindow(2000);
 std::chrono::seconds constexpr kBotLifecycleReplayTtl(10);
 std::chrono::seconds constexpr kBotLifecycleConnectTimeout(10);
 std::chrono::seconds constexpr kBotLifecyclePendingRetention(60);
-std::size_t constexpr kBotLifecycleMaxRecentTokens = 128;
+std::size_t constexpr kBotLifecycleMaxRecentTokens = 320;
 std::size_t constexpr kBotLifecycleMaxRequesterStates = 512;
 std::size_t constexpr kBotLifecycleMaxPendingConnects = 64;
 std::chrono::seconds constexpr kSelfBotHeavyActionRateWindow(10);
