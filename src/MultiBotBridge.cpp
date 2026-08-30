@@ -11540,12 +11540,9 @@ bool IsBotLifecycleControlRelationAllowed(
         sPlayerbotAIConfig.allowTrustedAccountBots
         && mgr->IsAccountLinked(target.AccountId, masterAccountId);
 
-    Group* const requesterGroup = requester->GetGroup();
-    bool const sameGroup =
-        requesterGroup
-        && requesterGroup->IsMember(targetGuid);
-
-    return sameAccount || sameGuild || addClassBot || linkedAccount || sameGroup;
+    // MB_BOT_LIFECYCLE_GROUP_AUTHORIZATION_B1_V1_BEGIN
+    return sameAccount || sameGuild || addClassBot || linkedAccount;
+    // MB_BOT_LIFECYCLE_GROUP_AUTHORIZATION_B1_V1_END
 }
 
 bool GetBotLifecyclePendingConnect(
