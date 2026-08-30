@@ -11561,14 +11561,12 @@ bool GetBotLifecyclePendingConnect(
     if (it == state->pendingConnects.end())
         return false;
 
-    if (now - it->second.startedAt >= kBotLifecycleConnectTimeout)
-    {
-        timedOut = true;
-        state->pendingConnects.erase(it);
-        return false;
-    }
+    // MB_BOT_LIFECYCLE_INFLIGHT_RETENTION_B2_V1_BEGIN
+    timedOut =
+        now - it->second.startedAt >= kBotLifecycleConnectTimeout;
 
     return true;
+    // MB_BOT_LIFECYCLE_INFLIGHT_RETENTION_B2_V1_END
 }
 
 void ClearBotLifecyclePendingConnect(Player* requester, uint32 lowGuid)
@@ -11588,15 +11586,12 @@ bool StartBotLifecyclePendingConnect(Player* requester, uint32 lowGuid)
     if (!state)
         return false;
 
-    for (auto it = state->pendingConnects.begin(); it != state->pendingConnects.end();)
-    {
-        if (now - it->second.startedAt >= kBotLifecycleConnectTimeout)
-            it = state->pendingConnects.erase(it);
-        else
-            ++it;
-    }
-
+    // MB_BOT_LIFECYCLE_INFLIGHT_RETENTION_B2_V1_BEGIN
+    // GetBotLifecycleRequesterState() already prunes entries only after the
+    // longer kBotLifecyclePendingRetention window. Timed-out reporting must
+    // not release an asynchronous AddPlayerBot operation still in flight.
     if (state->pendingConnects.size() >= kBotLifecycleMaxPendingConnects)
+    // MB_BOT_LIFECYCLE_INFLIGHT_RETENTION_B2_V1_END
         return false;
 
     state->pendingConnects[lowGuid] = {now};
@@ -11611,19 +11606,11 @@ std::size_t CountBotLifecyclePendingConnects(Player* requester)
     if (!state)
         return 0;
 
-    std::size_t count = 0;
-    for (auto it = state->pendingConnects.begin(); it != state->pendingConnects.end();)
-    {
-        if (now - it->second.startedAt >= kBotLifecycleConnectTimeout)
-            it = state->pendingConnects.erase(it);
-        else
-        {
-            ++count;
-            ++it;
-        }
-    }
-
-    return count;
+    // MB_BOT_LIFECYCLE_INFLIGHT_RETENTION_B2_V1_BEGIN
+    // Timed-out-but-retained connects still reserve bot capacity until
+    // completion is observed or kBotLifecyclePendingRetention expires.
+    return state->pendingConnects.size();
+    // MB_BOT_LIFECYCLE_INFLIGHT_RETENTION_B2_V1_END
 }
 
 void SendBotLifecycleResultPacket(
