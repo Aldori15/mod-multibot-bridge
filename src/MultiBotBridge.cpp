@@ -27,6 +27,7 @@
 #include "Playerbots.h"
 #include "RandomPlayerbotMgr.h"
 #include "ReputationMgr.h"
+#include "AttackAction.h"
 #include "AiObjectContext.h"
 #include "Event.h"
 #include "EventProcessor.h"
@@ -221,6 +222,7 @@ char const* const kBotLifecycleCapability = "BOT_LIFECYCLE_V1";
 char const* const kBotTargetResolveCapability = "BOT_TARGET_RESOLVE_V1";
 char const* const kFollowOrderCapability = "FOLLOW_ORDER_V1";
 char const* const kStayOrderCapability = "STAY_ORDER_V1";
+char const* const kAttackOrderCapability = "ATTACK_ORDER_V1";
 std::size_t constexpr kGroupOrderRateLimit = 8;
 std::chrono::milliseconds constexpr kGroupOrderRateWindow(2000);
 std::chrono::seconds constexpr kGroupOrderReplayTtl(10);
@@ -278,6 +280,7 @@ void RunGroupRollCommand(Player* requester, ChatMsg replyType, std::string const
 void RunFormationCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedFormation);
 void RunFollowOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken);
 void RunStayOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken);
+void RunAttackOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& audienceValue);
 void SendFormationPackets(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken);
 void SendBotReputationPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void SendBotEmblemPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
@@ -352,8 +355,9 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kAltRosterCapability,
         kBotLifecycleCapability,
         kBotTargetResolveCapability,
-        kFollowOrderCapability,
-        kStayOrderCapability
+kFollowOrderCapability,
+kStayOrderCapability,
+kAttackOrderCapability
     };
 
     std::vector<std::string> chunks;
@@ -9288,6 +9292,198 @@ void RunStayOrderCommand(Player* requester, ChatMsg replyType, std::string const
 }
 // MB_FOLLOW_STAY_ORDER_V1_END
 
+// MB_ATTACK_ORDER_V1_BEGIN
+class BridgeAttackAction final : public AttackAction
+{
+public:
+    explicit BridgeAttackAction(PlayerbotAI* botAI) : AttackAction(botAI, "bridge attack") {}
+
+    bool AttackTarget(Unit* target)
+    {
+        return Attack(target);
+    }
+};
+
+bool IsAllowedAttackAudience(std::string const& audience)
+{
+    return audience == "ALL" ||
+        audience == "TANK" ||
+        audience == "HEALER" ||
+        audience == "DPS" ||
+        audience == "MELEE" ||
+        audience == "RANGED";
+}
+
+bool BotMatchesAttackAudience(PlayerbotAI* botAI, Player* bot, std::string const& audience)
+{
+    if (!botAI || !bot)
+        return false;
+
+    if (audience == "ALL")
+        return true;
+    if (audience == "TANK")
+        return botAI->IsTank(bot);
+    if (audience == "HEALER")
+        return botAI->IsHeal(bot);
+    if (audience == "DPS")
+        return !botAI->IsTank(bot) && !botAI->IsHeal(bot);
+    if (audience == "RANGED")
+        return botAI->IsRanged(bot);
+    if (audience == "MELEE")
+        return !botAI->IsRanged(bot);
+
+    return false;
+}
+
+bool ApplyNativeAttackOrder(Player* requester, Player* bot, ObjectGuid const& targetGuid)
+{
+    if (!requester || !bot || !requester->GetSession() || !bot->GetSession() ||
+        !requester->IsInWorld() || !bot->IsInWorld() || !targetGuid)
+    {
+        return false;
+    }
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+    {
+        return false;
+    }
+
+    AiObjectContext* const context = botAI->GetAiObjectContext();
+    if (!context)
+        return false;
+
+    Unit* const target = botAI->GetUnit(targetGuid);
+    if (!target || !target->IsInWorld())
+        return false;
+
+    GuidVector const previousPrioritized = context->GetValue<GuidVector>("prioritized targets")->Get();
+    GuidVector const requestedPrioritized = {targetGuid};
+    context->GetValue<GuidVector>("prioritized targets")->Set(requestedPrioritized);
+
+    BridgeAttackAction attack(botAI);
+    if (!attack.AttackTarget(target))
+    {
+        context->GetValue<GuidVector>("prioritized targets")->Set(previousPrioritized);
+        return false;
+    }
+
+    context->GetValue<ObjectGuid>("pull target")->Set(targetGuid);
+
+    return bot->GetTarget() == targetGuid &&
+        context->GetValue<Unit*>("current target")->Get() == target &&
+        botAI->GetState() == BOT_STATE_COMBAT;
+}
+
+void SendAttackOrderAck(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& audience,
+    uint32 matched,
+    uint32 succeeded,
+    uint32 failed,
+    std::string const& reason)
+{
+    std::ostringstream payload;
+    payload << requestToken
+        << kFieldSeparator << audience
+        << kFieldSeparator << matched
+        << kFieldSeparator << succeeded
+        << kFieldSeparator << failed
+        << kFieldSeparator << reason;
+    SendAddonPacket(requester, replyType, "ATTACK_ORDER_ACK", payload.str());
+}
+
+void RunAttackOrderCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& audienceValue)
+{
+    std::string const token = Trim(requestToken);
+    std::string const audience = Trim(audienceValue);
+
+    if (!requester || !IsValidRequestToken(token))
+    {
+        SendAttackOrderAck(requester, replyType, token, audience, 0, 0, 0, "BAD_TOKEN");
+        return;
+    }
+
+    if (!IsAllowedAttackAudience(audience))
+    {
+        SendAttackOrderAck(requester, replyType, token, audience, 0, 0, 0, "BAD_AUDIENCE");
+        return;
+    }
+
+    if (!ConsumeGroupOrderRateLimit(requester))
+    {
+        SendAttackOrderAck(requester, replyType, token, audience, 0, 0, 0, "RATE_LIMIT");
+        return;
+    }
+
+    if (!RegisterGroupOrderToken(requester, token))
+    {
+        SendAttackOrderAck(requester, replyType, token, audience, 0, 0, 0, "REPLAY");
+        return;
+    }
+
+    Group* const requesterGroup = requester->GetGroup();
+    if (!requesterGroup)
+    {
+        SendAttackOrderAck(requester, replyType, token, audience, 0, 0, 0, "NO_GROUP");
+        return;
+    }
+
+    ObjectGuid const targetGuid = requester->GetTarget();
+    if (!targetGuid)
+    {
+        SendAttackOrderAck(requester, replyType, token, audience, 0, 0, 0, "NO_TARGET");
+        return;
+    }
+
+    uint32 matched = 0;
+    uint32 succeeded = 0;
+    uint32 failed = 0;
+    bool botLimitExceeded = false;
+
+    for (Player* const bot : GetBridgeVisibleBots(requester))
+    {
+        if (!bot || bot->GetGroup() != requesterGroup)
+            continue;
+
+        PlayerbotAI* const botAI = GetBotAI(bot);
+        if (!BotMatchesAttackAudience(botAI, bot, audience))
+            continue;
+
+        if (matched >= kGroupOrderMaxMatchedBots)
+        {
+            botLimitExceeded = true;
+            break;
+        }
+
+        ++matched;
+        if (ApplyNativeAttackOrder(requester, bot, targetGuid))
+            ++succeeded;
+        else
+            ++failed;
+    }
+
+    std::string reason = "OK";
+    if (botLimitExceeded)
+        reason = "BOT_LIMIT";
+    else if (matched == 0)
+        reason = "NO_BOTS";
+    else if (failed > 0 && succeeded > 0)
+        reason = "PARTIAL";
+    else if (failed > 0)
+        reason = "FAILED";
+
+    SendAttackOrderAck(requester, replyType, token, audience, matched, succeeded, failed, reason);
+}
+// MB_ATTACK_ORDER_V1_END
+
 bool ConsumeStrategyMutationRateLimit(Player* requester)
 {
     if (!requester)
@@ -13981,6 +14177,21 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         return true;
     }
     // MB_FOLLOW_STAY_ORDER_V1_DISPATCH_END
+
+// MB_ATTACK_ORDER_V1_DISPATCH_BEGIN
+if (requestType == "ATTACK_ORDER")
+{
+    std::string const token = GetSafeErrorToken(fields, 1);
+    if (fields.size() != 3)
+        return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+    if (!IsValidRequestToken(fields[1]))
+        return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+    RunAttackOrderCommand(player, replyType, fields[1], fields[2]);
+    return true;
+}
+// MB_ATTACK_ORDER_V1_DISPATCH_END
 
     if (requestType == "STRATEGY")
     {

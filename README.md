@@ -74,7 +74,7 @@ The module does **not** expose an arbitrary Playerbots command executor.
 | **Enchanting** | Dedicated Enchanting Trade Service using the native Trade workflow. |
 | **Quests** | Structured quest data and bot quest abandon. |
 | **Loot** | Loot-profile control and persistent exact always-loot item rules. |
-| **Group tools** | Formation, Roll and other migrated group controls. |
+| **Group tools** | Formation, Roll and other migrated controls, plus dedicated `FOLLOW_ORDER_V1`, `STAY_ORDER_V1` and `ATTACK_ORDER_V1` collective group-order endpoints. |
 | **SelfBot** | Dedicated SelfBot state, strategy and selected action endpoints. |
 | **Character information** | Stats, PvP stats, skills, reputations, currencies/emblems, spellbook and related data. |
 | **Outfits** | Structured outfit listing and actions. |
@@ -102,6 +102,37 @@ The Bridge:
 - prevents a simple offline group-membership relationship from granting lifecycle control by itself.
 
 The final authorization relationship is limited to the audited control relationships used by the project, including same-account, same-guild, AddClass and linked/trusted-account cases.
+
+---
+
+# Structured Group Orders — Follow / Stay / Attack
+
+The collective Follow, Stay and Attack controls use dedicated bounded endpoints rather than arbitrary Playerbots command execution.
+
+Advertised capabilities:
+
+```text
+FOLLOW_ORDER_V1
+STAY_ORDER_V1
+ATTACK_ORDER_V1
+```
+
+Follow and Stay reuse the audited Playerbots shortcut actions directly without routing through `HandleCommand()`. Attack uses a Bridge-local adapter over `AttackAction::Attack(Unit*)`, because the stock `AttackMyTargetAction` resolves the target from the bot master rather than from the requesting player.
+
+Attack audiences preserve the audited Playerbots selector semantics:
+
+```text
+ALL
+TANK   -> IsTank(bot)
+HEALER -> IsHeal(bot)
+DPS    -> !IsTank(bot) && !IsHeal(bot)
+MELEE  -> !IsRanged(bot)
+RANGED -> IsRanged(bot)
+```
+
+The Attack target is resolved server-side from `requester->GetTarget()`. Group scope, per-bot security, rate limiting, replay protection and bounded bot counts are enforced on the Bridge. ACKs are returned through structured addon messages.
+
+No generic `RUN~ORDER` endpoint is exposed.
 
 ---
 
@@ -165,6 +196,9 @@ SELF_ACTION_V1
 ALT_ROSTER_V1
 BOT_LIFECYCLE_V1
 BOT_TARGET_RESOLVE_V1
+FOLLOW_ORDER_V1
+STAY_ORDER_V1
+ATTACK_ORDER_V1
 ```
 
 The exact packet schemas are implementation details shared with the addon and may evolve with negotiated capability versions.
@@ -207,15 +241,9 @@ The Bridge is the primary adaptation layer for the MultiBot Chatless project and
 
 The project is intentionally described as **bridge-first / mostly chatless** until all remaining automatic legacy chat paths have been audited and either migrated, intentionally retained or removed.
 
-The next normal project item is a targeted read-only audit of the exact Playerbots selectors behind collective:
+Collective **Follow**, **Stay** and **Attack** are now implemented through dedicated structured Bridge endpoints and runtime validated. Their technical ACKs no longer depend on automatic chat transport or parsing, and the Bridge still exposes no generic Playerbots command executor.
 
-```text
-follow
-attack
-stay
-```
-
-before any dedicated structured group-order design is proposed.
+The next normal work is to continue auditing remaining automatic `CONTROL/PARSING` chat paths family by family while the project remains intentionally **bridge-first / mostly chatless**.
 
 Deferred work is tracked in the addon roadmap:
 
