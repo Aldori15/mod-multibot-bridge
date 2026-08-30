@@ -219,6 +219,14 @@ char const* const kSelfActionCapability = "SELF_ACTION_V1";
 char const* const kAltRosterCapability = "ALT_ROSTER_V1";
 char const* const kBotLifecycleCapability = "BOT_LIFECYCLE_V1";
 char const* const kBotTargetResolveCapability = "BOT_TARGET_RESOLVE_V1";
+char const* const kFollowOrderCapability = "FOLLOW_ORDER_V1";
+char const* const kStayOrderCapability = "STAY_ORDER_V1";
+std::size_t constexpr kGroupOrderRateLimit = 8;
+std::chrono::milliseconds constexpr kGroupOrderRateWindow(2000);
+std::chrono::seconds constexpr kGroupOrderReplayTtl(10);
+std::size_t constexpr kGroupOrderMaxRecentTokens = 32;
+std::size_t constexpr kGroupOrderMaxRequesterStates = 512;
+std::size_t constexpr kGroupOrderMaxMatchedBots = 40;
 uint32 constexpr kMaxItemActionCount = 1000;
 uint32 constexpr kMaxInventoryItemMoveCount = 1000;
 uint32 constexpr kMaxInventoryItemTradeCount = 1000;
@@ -268,6 +276,8 @@ void RunTalentSpecApplyCommand(Player* requester, ChatMsg replyType, std::string
 void RunQuestAbandonCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, uint32 questId);
 void RunGroupRollCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& modeValue, std::string const& encodedItemLink);
 void RunFormationCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedFormation);
+void RunFollowOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken);
+void RunStayOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken);
 void SendFormationPackets(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken);
 void SendBotReputationPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void SendBotEmblemPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
@@ -341,7 +351,9 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kSelfActionCapability,
         kAltRosterCapability,
         kBotLifecycleCapability,
-        kBotTargetResolveCapability
+        kBotTargetResolveCapability,
+        kFollowOrderCapability,
+        kStayOrderCapability
     };
 
     std::vector<std::string> chunks;
@@ -9067,6 +9079,215 @@ bool TryNormalizeStrategyChanges(
     return true;
 }
 
+// MB_FOLLOW_STAY_ORDER_V1_BEGIN
+struct GroupOrderRateState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+    std::deque<std::pair<std::string, std::chrono::steady_clock::time_point>> recentTokens;
+};
+
+std::map<std::string, GroupOrderRateState> sGroupOrderRateStates;
+
+bool ConsumeGroupOrderRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+    auto stateIt = sGroupOrderRateStates.find(key);
+
+    if (stateIt == sGroupOrderRateStates.end())
+    {
+        if (sGroupOrderRateStates.size() >= kGroupOrderMaxRequesterStates)
+        {
+            for (auto it = sGroupOrderRateStates.begin(); it != sGroupOrderRateStates.end();)
+            {
+                while (!it->second.requests.empty() && now - it->second.requests.front() >= kGroupOrderRateWindow)
+                    it->second.requests.pop_front();
+                while (!it->second.recentTokens.empty() && now - it->second.recentTokens.front().second >= kGroupOrderReplayTtl)
+                    it->second.recentTokens.pop_front();
+
+                if (it->second.requests.empty() && it->second.recentTokens.empty())
+                    it = sGroupOrderRateStates.erase(it);
+                else
+                    ++it;
+            }
+        }
+
+        if (sGroupOrderRateStates.size() >= kGroupOrderMaxRequesterStates)
+            return false;
+
+        stateIt = sGroupOrderRateStates.emplace(key, GroupOrderRateState{}).first;
+    }
+
+    GroupOrderRateState& state = stateIt->second;
+    while (!state.requests.empty() && now - state.requests.front() >= kGroupOrderRateWindow)
+        state.requests.pop_front();
+
+    if (state.requests.size() >= kGroupOrderRateLimit)
+        return false;
+
+    state.requests.push_back(now);
+    return true;
+}
+
+bool RegisterGroupOrderToken(Player* requester, std::string const& token)
+{
+    if (!requester || !IsValidRequestToken(token))
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+    auto stateIt = sGroupOrderRateStates.find(key);
+    if (stateIt == sGroupOrderRateStates.end())
+        return false;
+
+    GroupOrderRateState& state = stateIt->second;
+    while (!state.recentTokens.empty() && now - state.recentTokens.front().second >= kGroupOrderReplayTtl)
+        state.recentTokens.pop_front();
+
+    for (auto const& entry : state.recentTokens)
+        if (entry.first == token)
+            return false;
+
+    state.recentTokens.push_back({token, now});
+    while (state.recentTokens.size() > kGroupOrderMaxRecentTokens)
+        state.recentTokens.pop_front();
+
+    return true;
+}
+
+bool ApplyNativeGroupOrder(Player* requester, Player* bot, bool follow)
+{
+    if (!requester || !bot || !requester->IsInWorld() || !bot->IsInWorld())
+        return false;
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+    {
+        return false;
+    }
+
+    std::string const actionName = follow ? "follow chat shortcut" : "stay chat shortcut";
+    if (!botAI->DoSpecificAction(actionName, Event(actionName, "", requester), true))
+        return false;
+
+    if (follow)
+    {
+        return botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT) &&
+            !botAI->HasStrategy("follow", BOT_STATE_COMBAT) &&
+            !botAI->HasStrategy("stay", BOT_STATE_COMBAT);
+    }
+
+    return botAI->HasStrategy("stay", BOT_STATE_NON_COMBAT) &&
+        botAI->HasStrategy("stay", BOT_STATE_COMBAT) &&
+        !botAI->HasStrategy("follow", BOT_STATE_COMBAT);
+}
+
+void SendGroupOrderAck(
+    Player* requester,
+    ChatMsg replyType,
+    char const* opcode,
+    std::string const& requestToken,
+    uint32 matched,
+    uint32 succeeded,
+    uint32 failed,
+    std::string const& reason)
+{
+    std::ostringstream payload;
+    payload << requestToken
+        << kFieldSeparator << matched
+        << kFieldSeparator << succeeded
+        << kFieldSeparator << failed
+        << kFieldSeparator << reason;
+    SendAddonPacket(requester, replyType, opcode, payload.str());
+}
+
+void RunGroupOrderCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    bool follow)
+{
+    char const* const ackOpcode = follow ? "FOLLOW_ORDER_ACK" : "STAY_ORDER_ACK";
+    std::string const token = Trim(requestToken);
+
+    if (!requester || !IsValidRequestToken(token))
+    {
+        SendGroupOrderAck(requester, replyType, ackOpcode, token, 0, 0, 0, "BAD_TOKEN");
+        return;
+    }
+
+    if (!ConsumeGroupOrderRateLimit(requester))
+    {
+        SendGroupOrderAck(requester, replyType, ackOpcode, token, 0, 0, 0, "RATE_LIMIT");
+        return;
+    }
+
+    if (!RegisterGroupOrderToken(requester, token))
+    {
+        SendGroupOrderAck(requester, replyType, ackOpcode, token, 0, 0, 0, "REPLAY");
+        return;
+    }
+
+    Group* const requesterGroup = requester->GetGroup();
+    if (!requesterGroup)
+    {
+        SendGroupOrderAck(requester, replyType, ackOpcode, token, 0, 0, 0, "NO_GROUP");
+        return;
+    }
+
+    uint32 matched = 0;
+    uint32 succeeded = 0;
+    uint32 failed = 0;
+    bool limitExceeded = false;
+
+    for (Player* const bot : GetBridgeVisibleBots(requester))
+    {
+        if (!bot || bot->GetGroup() != requesterGroup)
+            continue;
+
+        if (matched >= kGroupOrderMaxMatchedBots)
+        {
+            limitExceeded = true;
+            break;
+        }
+
+        ++matched;
+        if (ApplyNativeGroupOrder(requester, bot, follow))
+            ++succeeded;
+        else
+            ++failed;
+    }
+
+    std::string reason = "OK";
+    if (limitExceeded)
+        reason = "BOT_LIMIT";
+    else if (matched == 0)
+        reason = "NO_BOTS";
+    else if (failed == 0)
+        reason = "OK";
+    else if (succeeded > 0)
+        reason = "PARTIAL";
+    else
+        reason = "FAILED";
+
+    SendGroupOrderAck(requester, replyType, ackOpcode, token, matched, succeeded, failed, reason);
+}
+
+void RunFollowOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken)
+{
+    RunGroupOrderCommand(requester, replyType, requestToken, true);
+}
+
+void RunStayOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken)
+{
+    RunGroupOrderCommand(requester, replyType, requestToken, false);
+}
+// MB_FOLLOW_STAY_ORDER_V1_END
+
 bool ConsumeStrategyMutationRateLimit(Player* requester)
 {
     if (!requester)
@@ -13741,6 +13962,25 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         RunInventoryItemActionCommand(player, replyType, fields[1], fields[2], fields[3], fields[4], fields[5]);
         return true;
     }
+
+    // MB_FOLLOW_STAY_ORDER_V1_DISPATCH_BEGIN
+    if (requestType == "FOLLOW_ORDER" || requestType == "STAY_ORDER")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 2)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        if (requestType == "FOLLOW_ORDER")
+            RunFollowOrderCommand(player, replyType, fields[1]);
+        else
+            RunStayOrderCommand(player, replyType, fields[1]);
+
+        return true;
+    }
+    // MB_FOLLOW_STAY_ORDER_V1_DISPATCH_END
 
     if (requestType == "STRATEGY")
     {
