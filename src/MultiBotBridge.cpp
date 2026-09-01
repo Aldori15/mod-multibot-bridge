@@ -52,6 +52,7 @@
 #include <deque>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -900,6 +901,7 @@ struct QuestProgressWatchState
     std::vector<QuestProgressSubscriber> subscribers;
 };
 
+std::mutex gQuestProgressWatchMutex;
 std::map<uint32, QuestProgressWatchState> gQuestProgressWatches;
 uint32 gQuestProgressPushSequence = 0;
 
@@ -2103,6 +2105,9 @@ void RegisterQuestProgressWatch(Player* requester, ChatMsg replyType, Player* bo
 
     uint32 const botGuid = bot->GetGUID().GetCounter();
     uint64 const fingerprint = BuildQuestProgressFingerprint(bot);
+
+    std::lock_guard<std::mutex> guard(gQuestProgressWatchMutex);
+
     QuestProgressWatchState& watch = gQuestProgressWatches[botGuid];
 
     for (QuestProgressSubscriber& subscriber : watch.subscribers)
@@ -2150,6 +2155,8 @@ void UpdateQuestProgressWatch(Player* bot, uint32 diff)
 {
     if (!bot)
         return;
+
+    std::lock_guard<std::mutex> guard(gQuestProgressWatchMutex);
 
     uint32 const botGuid = bot->GetGUID().GetCounter();
     auto watchItr = gQuestProgressWatches.find(botGuid);
@@ -2203,6 +2210,8 @@ void RemoveQuestProgressWatchesForPlayer(Player* player)
 
     ObjectGuid const playerGuid = player->GetGUID();
     uint32 const playerLowGuid = playerGuid.GetCounter();
+
+    std::lock_guard<std::mutex> guard(gQuestProgressWatchMutex);
 
     gQuestProgressWatches.erase(playerLowGuid);
 
