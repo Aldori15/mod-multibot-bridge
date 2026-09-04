@@ -2044,7 +2044,7 @@ void SendQuestProgressSnapshot(Player* requester, ChatMsg replyType, Player* bot
         payload << UrlEncodeField(botName)
             << kFieldSeparator << token
             << kFieldSeparator << questId
-            << kFieldSeparator << (status == QUEST_STATUS_COMPLETE ? "C" : "I");
+            << kFieldSeparator << (status == QUEST_STATUS_COMPLETE ? "C" : status == QUEST_STATUS_FAILED ? "F" : "I");
 
         SendAddonPacket(requester, replyType, "QUEST_PROGRESS_QUEST", payload.str());
 
