@@ -2167,6 +2167,20 @@ uint64 BuildQuestProgressFingerprint(Player* bot)
 
         hash = MixQuestProgressHash(hash, progress.PlayerCount);
         hash = MixQuestProgressHash(hash, progress.Explored ? 1 : 0);
+
+        Quest const* const quest = sObjectMgr->GetQuestTemplate(questId);
+        if (quest)
+        {
+            uint32 const factionId = quest->GetRepObjectiveFaction();
+
+            if (factionId)
+            {
+                int32 const standing = bot->GetReputationMgr().GetReputation(factionId);
+
+                hash = MixQuestProgressHash(hash, factionId);
+                hash = MixQuestProgressHash(hash, static_cast<uint32>(standing));
+            }
+        }
     }
 
     return hash;
@@ -2284,6 +2298,28 @@ bool BuildQuestProgressSnapshot(Player* bot, std::string const& token, QuestProg
 
         if (quest->HasSpecialFlag(QUEST_SPECIAL_FLAGS_EXPLORATION_OR_EVENT) && !AppendQuestProgressObjectivePacket(packets, botName, token, questId, 'e', 1, 0, progress.Explored ? 1 : 0, 1))
             return false;
+
+        uint32 const factionId = quest->GetRepObjectiveFaction();
+
+        if (factionId)
+        {
+            int32 const standing = bot->GetReputationMgr().GetReputation(factionId);
+            int32 const required = quest->GetRepObjectiveValue();
+
+            std::ostringstream payload;
+            payload << UrlEncodeField(botName)
+                << kFieldSeparator << token
+                << kFieldSeparator << questId
+                << kFieldSeparator << 'r'
+                << kFieldSeparator << 1
+                << kFieldSeparator << factionId
+                << kFieldSeparator << standing
+                << kFieldSeparator << required
+                << kFieldSeparator << (standing >= required ? 1 : 0);
+
+            if (!AppendQuestProgressPacket(packets, "QUEST_PROGRESS_OBJECTIVE", payload.str()))
+                return false;
+        }
     }
 
     return AppendQuestProgressPacket(packets, "QUEST_PROGRESS_END", headerPayload);
