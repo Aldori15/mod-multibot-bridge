@@ -1050,6 +1050,7 @@ struct QuestProgressSubscriber
     ChatMsg replyType = CHAT_MSG_WHISPER;
     uint64 lastFingerprint = 0;
     std::string requestToken;
+    std::chrono::steady_clock::time_point expiresAt{};
 };
 
 struct QuestProgressWatchState
@@ -2277,6 +2278,7 @@ void RegisterQuestProgressWatch(Player* requester, ChatMsg replyType, Player* bo
 
     uint32 const botGuid = bot->GetGUID().GetCounter();
     uint64 const fingerprint = BuildQuestProgressFingerprint(bot);
+    auto const expiresAt = std::chrono::steady_clock::now() + std::chrono::seconds(180);
 
     std::lock_guard<std::mutex> guard(gQuestProgressWatchMutex);
 
@@ -2290,6 +2292,7 @@ void RegisterQuestProgressWatch(Player* requester, ChatMsg replyType, Player* bo
             subscriber.replyType = replyType;
             subscriber.lastFingerprint = fingerprint;
             subscriber.requestToken = requestToken;
+            subscriber.expiresAt = expiresAt;
             return;
         }
     }
@@ -2299,6 +2302,7 @@ void RegisterQuestProgressWatch(Player* requester, ChatMsg replyType, Player* bo
     subscriber.replyType = replyType;
     subscriber.lastFingerprint = fingerprint;
     subscriber.requestToken = requestToken;
+    subscriber.expiresAt = expiresAt;
     watch.subscribers.push_back(subscriber);
 }
 
@@ -2395,12 +2399,13 @@ void UpdateQuestProgressWatch(Player* bot, uint32 diff)
     }
 
     uint64 const fingerprint = BuildQuestProgressFingerprint(bot);
+    auto const now = std::chrono::steady_clock::now();
 
     for (auto subscriberItr = watch.subscribers.begin(); subscriberItr != watch.subscribers.end();)
     {
         Player* const requester = ObjectAccessor::FindConnectedPlayer(subscriberItr->requesterGuid);
 
-        if (!requester || requester->GetGroup() != botGroup)
+        if (now >= subscriberItr->expiresAt || !requester || requester->GetGroup() != botGroup)
         {
             subscriberItr = watch.subscribers.erase(subscriberItr);
             continue;
