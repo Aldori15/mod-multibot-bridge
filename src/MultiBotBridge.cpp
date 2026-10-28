@@ -2172,10 +2172,20 @@ uint64 BuildQuestProgressFingerprint(Player* bot)
     return hash;
 }
 
-void SendQuestProgressObjectivePacket(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& token, uint32 questId, char objectiveType, uint8 sourceSlot, uint32 objectiveId, uint32 current, uint32 required)
+using QuestProgressPackets = std::vector<std::pair<std::string, std::string>>;
+bool AppendQuestProgressPacket(QuestProgressPackets& packets, std::string const& opcode, std::string const& payload)
 {
-    if (!requester || !required)
-        return;
+    if (!IsAddonPacketWithinBudget(opcode, payload))
+        return false;
+
+    packets.emplace_back(opcode, payload);
+    return true;
+}
+
+bool AppendQuestProgressObjectivePacket(QuestProgressPackets& packets, std::string const& botName, std::string const& token, uint32 questId, char objectiveType, uint8 sourceSlot, uint32 objectiveId, uint32 current, uint32 required)
+{
+    if (!required)
+        return true;
 
     current = std::min(current, required);
 
@@ -2189,19 +2199,21 @@ void SendQuestProgressObjectivePacket(Player* requester, ChatMsg replyType, std:
         << kFieldSeparator << current
         << kFieldSeparator << required;
 
-    SendAddonPacket(requester, replyType, "QUEST_PROGRESS_OBJECTIVE", payload.str());
+    return AppendQuestProgressPacket(packets, "QUEST_PROGRESS_OBJECTIVE", payload.str());
 }
 
-void SendQuestProgressSnapshot(Player* requester, ChatMsg replyType, Player* bot, std::string const& token)
+bool BuildQuestProgressSnapshot(Player* bot, std::string const& token, QuestProgressPackets& packets)
 {
-    if (!requester || !bot)
-        return;
+    if (!bot)
+        return false;
 
     std::string const botName = bot->GetName();
     std::string const headerPayload = UrlEncodeField(botName) + std::string(1, kFieldSeparator) + token;
+
     QuestStatusMap const& questStatusMap = bot->getQuestStatusMap();
 
-    SendAddonPacket(requester, replyType, "QUEST_PROGRESS_BEGIN", headerPayload);
+    if (!AppendQuestProgressPacket(packets, "QUEST_PROGRESS_BEGIN", headerPayload))
+        return false;
 
     for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
     {
@@ -2210,16 +2222,21 @@ void SendQuestProgressSnapshot(Player* requester, ChatMsg replyType, Player* bot
             continue;
 
         QuestStatus const status = bot->GetQuestStatus(questId);
-        if (status != QUEST_STATUS_INCOMPLETE && status != QUEST_STATUS_COMPLETE && status != QUEST_STATUS_FAILED)
+        if (status != QUEST_STATUS_INCOMPLETE &&
+            status != QUEST_STATUS_COMPLETE &&
+            status != QUEST_STATUS_FAILED)
             continue;
 
         std::ostringstream payload;
         payload << UrlEncodeField(botName)
             << kFieldSeparator << token
             << kFieldSeparator << questId
-            << kFieldSeparator << (status == QUEST_STATUS_COMPLETE ? "C" : status == QUEST_STATUS_FAILED ? "F" : "I");
+            << kFieldSeparator
+            << (status == QUEST_STATUS_COMPLETE ? "C" :
+                status == QUEST_STATUS_FAILED ? "F" : "I");
 
-        SendAddonPacket(requester, replyType, "QUEST_PROGRESS_QUEST", payload.str());
+        if (!AppendQuestProgressPacket(packets, "QUEST_PROGRESS_QUEST", payload.str()))
+            return false;
 
         Quest const* const quest = sObjectMgr->GetQuestTemplate(questId);
         if (!quest)
@@ -2231,40 +2248,51 @@ void SendQuestProgressSnapshot(Player* requester, ChatMsg replyType, Player* bot
 
         QuestStatusData const& progress = statusItr->second;
 
-        for (uint8 objectiveIndex = 0; objectiveIndex < QUEST_OBJECTIVES_COUNT; ++objectiveIndex)
+        for (uint8 i = 0; i < QUEST_OBJECTIVES_COUNT; ++i)
         {
-            int32 const targetId = quest->RequiredNpcOrGo[objectiveIndex];
-            uint32 const required = quest->RequiredNpcOrGoCount[objectiveIndex];
+            int32 const targetId = quest->RequiredNpcOrGo[i];
+            uint32 const required = quest->RequiredNpcOrGoCount[i];
 
             if (!targetId || !required)
                 continue;
 
             char const objectiveType = targetId > 0 ? 'm' : 'o';
-            uint32 const objectiveId = targetId > 0 ? static_cast<uint32>(targetId) : static_cast<uint32>(-targetId);
+            uint32 const objectiveId = targetId > 0
+                ? static_cast<uint32>(targetId)
+                : static_cast<uint32>(-targetId);
 
-            SendQuestProgressObjectivePacket(requester, replyType, botName, token, questId, objectiveType, objectiveIndex + 1, objectiveId, progress.CreatureOrGOCount[objectiveIndex], required);
+            if (!AppendQuestProgressObjectivePacket(packets, botName, token, questId, objectiveType, i + 1, objectiveId, progress.CreatureOrGOCount[i], required))
+                return false;
         }
 
-        for (uint8 objectiveIndex = 0; objectiveIndex < QUEST_ITEM_OBJECTIVES_COUNT; ++objectiveIndex)
+        for (uint8 i = 0; i < QUEST_ITEM_OBJECTIVES_COUNT; ++i)
         {
-            uint32 const itemId = quest->RequiredItemId[objectiveIndex];
-            uint32 const required = quest->RequiredItemCount[objectiveIndex];
+            uint32 const itemId = quest->RequiredItemId[i];
+            uint32 const required = quest->RequiredItemCount[i];
 
             if (!itemId || !required)
                 continue;
 
-            SendQuestProgressObjectivePacket(requester, replyType, botName, token, questId, 'i', objectiveIndex + 1, itemId, progress.ItemCount[objectiveIndex], required);
+            if (!AppendQuestProgressObjectivePacket(packets, botName, token, questId, 'i', i + 1, itemId, progress.ItemCount[i], required))
+                return false;
         }
 
         uint32 const requiredPlayerKills = quest->GetPlayersSlain();
-        if (requiredPlayerKills)
-            SendQuestProgressObjectivePacket(requester, replyType, botName, token, questId, 'p', 1, 0, progress.PlayerCount, requiredPlayerKills);
 
-        if (quest->HasSpecialFlag(QUEST_SPECIAL_FLAGS_EXPLORATION_OR_EVENT))
-            SendQuestProgressObjectivePacket(requester, replyType, botName, token, questId, 'e', 1, 0, progress.Explored ? 1 : 0, 1);
+        if (requiredPlayerKills && !AppendQuestProgressObjectivePacket(packets, botName, token, questId, 'p', 1, 0, progress.PlayerCount, requiredPlayerKills))
+            return false;
+
+        if (quest->HasSpecialFlag(QUEST_SPECIAL_FLAGS_EXPLORATION_OR_EVENT) && !AppendQuestProgressObjectivePacket(packets, botName, token, questId, 'e', 1, 0, progress.Explored ? 1 : 0, 1))
+            return false;
     }
 
-    SendAddonPacket(requester, replyType, "QUEST_PROGRESS_END", headerPayload);
+    return AppendQuestProgressPacket(packets, "QUEST_PROGRESS_END", headerPayload);
+}
+
+void SendQuestProgressSnapshot(Player* requester, ChatMsg replyType, QuestProgressPackets const& packets)
+{
+    for (auto const& packet : packets)
+        SendAddonPacket(requester, replyType, packet.first, packet.second);
 }
 
 void RegisterQuestProgressWatch(Player* requester, ChatMsg replyType, Player* bot, std::string const& requestToken)
@@ -2420,10 +2448,18 @@ void SendQuestProgressPackets(Player* requester, ChatMsg replyType, std::string 
         return;
     }
 
+    QuestProgressPackets packets;
+
+    if (!BuildQuestProgressSnapshot(bot, token, packets))
+    {
+        SendProtocolError(requester, replyType, "GET", "QUEST_PROGRESS", token, "SNAPSHOT_TOO_LONG");
+        return;
+    }
+
     if (watch)
         RegisterQuestProgressWatch(requester, replyType, bot, token);
 
-    SendQuestProgressSnapshot(requester, replyType, bot, token);
+    SendQuestProgressSnapshot(requester, replyType, packets);
 }
 
 std::string MakeQuestProgressPushToken(Player* bot)
@@ -2474,8 +2510,13 @@ void UpdateQuestProgressWatch(Player* bot, uint32 diff)
 
         if (fingerprint != subscriberItr->lastFingerprint)
         {
-            SendQuestProgressSnapshot(requester, subscriberItr->replyType, bot, MakeQuestProgressPushToken(bot));
-            subscriberItr->lastFingerprint = fingerprint;
+            QuestProgressPackets packets;
+
+            if (BuildQuestProgressSnapshot(bot, MakeQuestProgressPushToken(bot), packets))
+            {
+                SendQuestProgressSnapshot(requester, subscriberItr->replyType, packets);
+                subscriberItr->lastFingerprint = fingerprint;
+            }
         }
 
         ++subscriberItr;
