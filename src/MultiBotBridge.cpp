@@ -2347,18 +2347,64 @@ void UnregisterQuestProgressWatch(Player* requester, std::string const& botName,
     }
 }
 
+Player* FindQuestProgressBotByName(Player* requester, std::string const& botName)
+{
+    if (!requester)
+        return nullptr;
+
+    std::string const wantedName = Trim(botName);
+    if (wantedName.empty())
+        return nullptr;
+
+    // Group members may observe eligible Playerbots even when another account controls them.
+    if (Group* const group = requester->GetGroup())
+    {
+        for (GroupReference* ref = group->GetFirstMember();
+             ref != nullptr;
+             ref = ref->next())
+        {
+            Player* const member = ref->GetSource();
+
+            if (member &&
+                member != requester &&
+                member->GetName() == wantedName &&
+                member->GetGroup() == group &&
+                member->IsInWorld() &&
+                member->GetSession() &&
+                GetBotAI(member) &&
+                !IsSelfBot(member))
+            {
+                return member;
+            }
+        }
+    }
+
+    // Preserve existing visibility rules for non-group GETs.
+    return FindBotByName(requester, wantedName);
+}
+
 bool CanReadQuestProgress(Player* requester, Player* bot)
 {
     if (!requester || !bot || requester == bot ||
+        !requester->IsInWorld() ||
         !requester->GetSession() ||
         requester->GetSession()->IsSocketClosed() ||
         !bot->GetSession() ||
-        !bot->IsInWorld())
+        !bot->IsInWorld() ||
+        IsSelfBot(bot))
         return false;
 
     PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI)
+        return false;
 
-    return botAI && botAI->GetSecurity() && botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester);
+    // Party membership grants read-only quest observation.
+    // It does not grant permission to control the bot.
+    if (IsBotInRequesterGroup(requester, bot))
+        return true;
+
+    // Outside the group, preserve normal bot security rules.
+    return botAI->GetSecurity() && botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester);
 }
 
 void SendQuestProgressPackets(Player* requester, ChatMsg replyType, std::string const& botNameValue, std::string const& token, bool watch)
@@ -2366,7 +2412,7 @@ void SendQuestProgressPackets(Player* requester, ChatMsg replyType, std::string 
     if (!requester)
         return;
 
-    Player* const bot = FindBotByName(requester, botNameValue);
+    Player* const bot = FindQuestProgressBotByName(requester, botNameValue);
 
     if (!CanReadQuestProgress(requester, bot) || (watch && !IsBotInRequesterGroup(requester, bot)))
     {
