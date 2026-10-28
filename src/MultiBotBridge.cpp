@@ -1049,11 +1049,13 @@ struct QuestProgressSubscriber
     ObjectGuid requesterGuid;
     ChatMsg replyType = CHAT_MSG_WHISPER;
     uint64 lastFingerprint = 0;
+    std::string requestToken;
 };
 
 struct QuestProgressWatchState
 {
     uint32 elapsedMs = 0;
+    std::string botName;
     std::vector<QuestProgressSubscriber> subscribers;
 };
 
@@ -2264,7 +2266,7 @@ void SendQuestProgressSnapshot(Player* requester, ChatMsg replyType, Player* bot
     SendAddonPacket(requester, replyType, "QUEST_PROGRESS_END", headerPayload);
 }
 
-void RegisterQuestProgressWatch(Player* requester, ChatMsg replyType, Player* bot)
+void RegisterQuestProgressWatch(Player* requester, ChatMsg replyType, Player* bot, std::string const& requestToken)
 {
     if (!requester || !bot)
         return;
@@ -2279,6 +2281,7 @@ void RegisterQuestProgressWatch(Player* requester, ChatMsg replyType, Player* bo
     std::lock_guard<std::mutex> guard(gQuestProgressWatchMutex);
 
     QuestProgressWatchState& watch = gQuestProgressWatches[botGuid];
+    watch.botName = bot->GetName();
 
     for (QuestProgressSubscriber& subscriber : watch.subscribers)
     {
@@ -2286,6 +2289,7 @@ void RegisterQuestProgressWatch(Player* requester, ChatMsg replyType, Player* bo
         {
             subscriber.replyType = replyType;
             subscriber.lastFingerprint = fingerprint;
+            subscriber.requestToken = requestToken;
             return;
         }
     }
@@ -2294,7 +2298,49 @@ void RegisterQuestProgressWatch(Player* requester, ChatMsg replyType, Player* bo
     subscriber.requesterGuid = requester->GetGUID();
     subscriber.replyType = replyType;
     subscriber.lastFingerprint = fingerprint;
+    subscriber.requestToken = requestToken;
     watch.subscribers.push_back(subscriber);
+}
+
+void UnregisterQuestProgressWatch(Player* requester, std::string const& botName, std::string const& requestToken)
+{
+    if (!requester)
+        return;
+
+    ObjectGuid const requesterGuid = requester->GetGUID();
+    std::string const normalizedName = ToLower(botName);
+
+    std::lock_guard<std::mutex> guard(gQuestProgressWatchMutex);
+
+    for (auto it = gQuestProgressWatches.begin();
+         it != gQuestProgressWatches.end();)
+    {
+        QuestProgressWatchState& watch = it->second;
+
+        if (ToLower(watch.botName) != normalizedName)
+        {
+            ++it;
+            continue;
+        }
+
+        auto& subscribers = watch.subscribers;
+
+        subscribers.erase(
+            std::remove_if(
+                subscribers.begin(),
+                subscribers.end(),
+                [&](QuestProgressSubscriber const& subscriber)
+                {
+                    return subscriber.requesterGuid == requesterGuid
+                        && subscriber.requestToken == requestToken;
+                }),
+            subscribers.end());
+
+        if (subscribers.empty())
+            it = gQuestProgressWatches.erase(it);
+        else
+            ++it;
+    }
 }
 
 void SendQuestProgressPackets(Player* requester, ChatMsg replyType, std::string const& botNameValue, std::string const& token, bool watch)
@@ -2310,7 +2356,7 @@ void SendQuestProgressPackets(Player* requester, ChatMsg replyType, std::string 
     }
 
     if (watch)
-        RegisterQuestProgressWatch(requester, replyType, bot);
+        RegisterQuestProgressWatch(requester, replyType, bot, token);
 
     SendQuestProgressSnapshot(requester, replyType, bot, token);
 }
@@ -20699,17 +20745,26 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
                 return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
 
             bool watch = false;
+            bool unwatch = false;
 
             if (fields.size() == 4)
             {
-                if (fields[3] != "WATCH")
+                if (fields[3] == "WATCH")
+                    watch = true;
+                else if (fields[3] == "UNWATCH")
+                    unwatch = true;
+                else
                     return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_MODE");
-
-                watch = true;
             }
 
             if (!ConsumeQuestProgressRateLimit(player))
                 return SendProtocolError(player, replyType, normalized, requestType, token, "RATE_LIMIT");
+
+            if (unwatch)
+            {
+                UnregisterQuestProgressWatch(player, fields[1], fields[2]);
+                return true;
+            }
 
             SendQuestProgressPackets(player, replyType, fields[1], fields[2], watch);
             return true;
