@@ -2226,7 +2226,7 @@ bool BuildQuestProgressSnapshot(Player* bot, std::string const& token, QuestProg
 
     QuestStatusMap const& questStatusMap = bot->getQuestStatusMap();
 
-    if (!AppendQuestProgressPacket(packets, "QUEST_PROGRESS_BEGIN", headerPayload))
+    if (!AppendQuestProgressPacket(packets, "QUEST_PROGRESS_BEGIN", headerPayload + std::string(1, kFieldSeparator) + bot->GetGUID().ToString()))
         return false;
 
     for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
