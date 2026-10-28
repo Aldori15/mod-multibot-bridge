@@ -2347,13 +2347,28 @@ void UnregisterQuestProgressWatch(Player* requester, std::string const& botName,
     }
 }
 
+bool CanReadQuestProgress(Player* requester, Player* bot)
+{
+    if (!requester || !bot || requester == bot ||
+        !requester->GetSession() ||
+        requester->GetSession()->IsSocketClosed() ||
+        !bot->GetSession() ||
+        !bot->IsInWorld())
+        return false;
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+
+    return botAI && botAI->GetSecurity() && botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester);
+}
+
 void SendQuestProgressPackets(Player* requester, ChatMsg replyType, std::string const& botNameValue, std::string const& token, bool watch)
 {
     if (!requester)
         return;
 
     Player* const bot = FindBotByName(requester, botNameValue);
-    if (!bot)
+
+    if (!CanReadQuestProgress(requester, bot) || (watch && !IsBotInRequesterGroup(requester, bot)))
     {
         SendAddonPacket(requester, replyType, "QUEST_PROGRESS_END", UrlEncodeField(botNameValue) + std::string(1, kFieldSeparator) + token + std::string(1, kFieldSeparator) + "NO_BOT");
         return;
